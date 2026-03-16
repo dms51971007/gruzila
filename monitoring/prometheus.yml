@@ -1,0 +1,8 @@
+# Prometheus config for gruzilla-executor metrics.
+# Executor runs on host; use host.docker.internal (Windows/Mac) or host IP on Linux.
+scrape_configs:
+  - job_name: gruzilla-executor
+    static_configs:
+      - targets: ['host.docker.internal:8081']
+    metrics_path: /metrics
+    scrape_interval: 5s

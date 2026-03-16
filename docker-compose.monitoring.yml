@@ -1,0 +1,35 @@
+# Prometheus + Grafana для метрик gruzilla-executor.
+# Запуск: из корня gruzilla выполнить
+#   docker compose -f docker-compose.monitoring.yml up -d
+# Executor должен быть запущен на хосте на порту 8081 (или изменить target в monitoring/prometheus.yml).
+# Grafana: http://localhost:3000 (admin / admin). Добавить Data source → Prometheus → URL http://prometheus:9090.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  grafana_data:
