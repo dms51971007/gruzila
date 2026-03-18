@@ -1,0 +1,9 @@
+addr: ":8080"
+cli:
+  command: "go"
+  args:
+    - "run"
+    - "./cmd/gruzilla-cli"
+  workdir: "."
+  timeout_seconds: 30
+  default_executor_url: "http://localhost:8081"
