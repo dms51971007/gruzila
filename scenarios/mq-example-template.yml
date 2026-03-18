@@ -1,0 +1,14 @@
+# Пример IBM MQ с телом сообщения из шаблона templates/mq-request.json.tmpl
+# Переменные: clientGuid, requestId, operation, timestamp (и mq-параметры)
+name: "ibm-mq-example-template"
+description: "IBM MQ put test with templated body"
+steps:
+  - type: mq
+    name: "put-to-queue"
+    queue: "DEV.QUEUE.1"
+    mq_conn_name: "{{mqHost}}(1414)"
+    mq_channel: "DEV.APP.SVRCONN"
+    mq_queue_manager: "QM1"
+    mq_user: "{{mqUser}}"
+    mq_password: "{{mqPassword}}"
+    template: "mq-request.json.tmpl"

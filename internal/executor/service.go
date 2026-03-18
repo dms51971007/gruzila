@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,12 +18,14 @@ import (
 	"gruzilla/internal/scenario"
 	"gruzilla/internal/templates"
 
-	"github.com/segmentio/kafka-go"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/segmentio/kafka-go"
 )
 
 var ErrNotRunning = errors.New("executor is not running")
 
+// RunConfig описывает внешнюю конфигурацию запуска нагрузки.
+// Значения приходят через API/CLI и применяются на каждом тике runLoop.
 type RunConfig struct {
 	Percent       int               `json:"percent"`
 	BaseTPS       float64           `json:"base_tps"`
@@ -30,15 +33,19 @@ type RunConfig struct {
 	Variables     map[string]string `json:"variables,omitempty"`
 }
 
+// Metrics — runtime-метрики текущего прогона.
+// AttemptsCount считает запущенные итерации сценария, а не только success.
 type Metrics struct {
 	AttemptsCount int64   `json:"attempts_count"` // всего запущено попыток (success + error + in-flight)
 	SuccessCount  int64   `json:"success_count"`
 	ErrorCount    int64   `json:"error_count"`
 	LastLatency   int64   `json:"last_latency_ms"`
-	TargetTPS     float64 `json:"target_tps"`  // к какому TPS стремимся (effectiveTPS)
-	CurrentTPS    float64 `json:"current_tps"` // сколько реально попыток запустили за последнюю секунду
+	AdaptiveTPS   float64 `json:"adaptive_tps"` // динамический ceiling, до которого режем target_tps
+	TargetTPS     float64 `json:"target_tps"`   // к какому TPS стремимся (effectiveTPS)
+	CurrentTPS    float64 `json:"current_tps"`  // сколько реально попыток запустили за последнюю секунду
 }
 
+// Status — полный снимок состояния executor для API /status.
 type Status struct {
 	Running      bool       `json:"running"`
 	ScenarioPath string     `json:"scenario_path"`
@@ -49,6 +56,7 @@ type Status struct {
 	LastError    string     `json:"last_error,omitempty"`
 }
 
+// Service управляет жизненным циклом сценария, runLoop и счётчиками.
 type Service struct {
 	mu            sync.RWMutex
 	status        Status
@@ -63,6 +71,7 @@ type Service struct {
 	prom          *PrometheusMetrics
 }
 
+// NewService загружает сценарий с диска и инициализирует Service.
 func NewService(scenarioPath string) (*Service, error) {
 	sc, err := scenario.LoadFromFile(scenarioPath)
 	if err != nil {
@@ -82,6 +91,8 @@ func NewService(scenarioPath string) (*Service, error) {
 	}, nil
 }
 
+// Start запускает фоновый runLoop с заданной конфигурацией.
+// Повторный вызов при уже активном run возвращает ошибку.
 func (s *Service) Start(cfg RunConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -109,6 +120,7 @@ func (s *Service) Start(cfg RunConfig) error {
 	return nil
 }
 
+// Stop останавливает runLoop и фиксирует running=false в статусе.
 func (s *Service) Stop() error {
 	s.mu.Lock()
 	if !s.running {
@@ -133,6 +145,7 @@ func (s *Service) Stop() error {
 	return nil
 }
 
+// Update применяет изменение конфигурации "на лету" без остановки runLoop.
 func (s *Service) Update(cfg RunConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -151,6 +164,7 @@ func (s *Service) Update(cfg RunConfig) error {
 	return nil
 }
 
+// Status возвращает агрегированный статус с актуальными атомарными счётчиками.
 func (s *Service) Status() Status {
 	s.mu.RLock()
 	st := s.status
@@ -162,6 +176,7 @@ func (s *Service) Status() Status {
 	return st
 }
 
+// Metrics возвращает срез метрик без служебных полей Status.
 func (s *Service) Metrics() Metrics {
 	s.mu.RLock()
 	m := s.status.Metrics
@@ -188,6 +203,7 @@ func (s *Service) ResetMetrics() error {
 	s.status.StartedAt = nil
 	s.status.Metrics.TargetTPS = 0
 	s.status.Metrics.CurrentTPS = 0
+	s.status.Metrics.AdaptiveTPS = 0
 	return nil
 }
 
@@ -214,11 +230,21 @@ func (s *Service) Reload() error {
 	return nil
 }
 
+// runLoop — основной цикл планирования нагрузки (тик раз в секунду).
+// На каждом тике:
+// 1) рассчитывает desired/target TPS;
+// 2) запускает нужное число итераций сценария (без блокирующего wait batch);
+// 3) пересчитывает current TPS и adaptive cap;
+// 4) обновляет status и Prometheus-метрики.
 func (s *Service) runLoop(stop <-chan struct{}) {
 	r := newRunner(s.buildVariables)
 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	lastTPSSampleAt := time.Now()
+	adaptiveCapTPS := 0.0
+	// Ограничиваем число одновременных попыток, но не блокируем runLoop ожиданием batch.
+	inflightLimiter := make(chan struct{}, 4096)
 
 	for {
 		select {
@@ -226,18 +252,30 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			cfg, startedAt := s.currentConfig()
-			targetTPS := effectiveTPS(cfg, startedAt)
+			desiredTPS := effectiveTPS(cfg, startedAt)
+			if adaptiveCapTPS <= 0 {
+				adaptiveCapTPS = desiredTPS
+			}
+			// Effective target is capped by what the system has recently sustained.
+			targetTPS := desiredTPS
+			if adaptiveCapTPS > 0 && targetTPS > adaptiveCapTPS {
+				targetTPS = adaptiveCapTPS
+			}
 
 			iterations := int(math.Round(targetTPS))
 			if targetTPS > 0 && iterations == 0 {
 				iterations = 1
 			}
 
-			var wg sync.WaitGroup
 			for i := 0; i < iterations; i++ {
-				wg.Add(1)
+				select {
+				case inflightLimiter <- struct{}{}:
+				default:
+					// Saturated: skip this slot for current cycle.
+					continue
+				}
 				go func() {
-					defer wg.Done()
+					defer func() { <-inflightLimiter }()
 					s.attemptsCount.Add(1)
 					started := time.Now()
 					var err error
@@ -262,14 +300,40 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 					s.successCount.Add(1)
 				}()
 			}
-			wg.Wait()
 
-			// Реальный TPS считаем как прирост attempts_count за секунду.
+			// Реальный TPS считаем как прирост attempts_count за фактический интервал.
 			currentAttempts := s.attemptsCount.Load()
 			prevAttempts := s.lastAttempts.Swap(currentAttempts)
-			currentTPS := float64(currentAttempts - prevAttempts)
+			now := time.Now()
+			elapsedSec := now.Sub(lastTPSSampleAt).Seconds()
+			lastTPSSampleAt = now
+			currentTPS := 0.0
+			if elapsedSec > 0 {
+				currentTPS = float64(currentAttempts-prevAttempts) / elapsedSec
+			}
+
+			// Adapt cap with bounded decay/recovery.
+			// Important: never drop cap to a single noisy sample instantly.
+			if currentTPS < targetTPS*0.95 {
+				decayed := adaptiveCapTPS * 0.85 // max 15% drop per cycle
+				if currentTPS > 0 && decayed < currentTPS {
+					decayed = currentTPS
+				}
+				if decayed < 1 {
+					decayed = 1
+				}
+				adaptiveCapTPS = decayed
+			} else {
+				// recover faster than before to avoid being stuck too low
+				grow := adaptiveCapTPS*1.2 + 1
+				if grow < 1 {
+					grow = 1
+				}
+				adaptiveCapTPS = math.Min(desiredTPS, grow)
+			}
 
 			s.mu.Lock()
+			s.status.Metrics.AdaptiveTPS = adaptiveCapTPS
 			s.status.Metrics.TargetTPS = targetTPS
 			s.status.Metrics.CurrentTPS = currentTPS
 			s.mu.Unlock()
@@ -289,12 +353,15 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 	}
 }
 
+// currentConfig безопасно читает текущий RunConfig и startedAt.
 func (s *Service) currentConfig() (RunConfig, *time.Time) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.status.Config, s.status.StartedAt
 }
 
+// effectiveTPS вычисляет целевой TPS с учётом percent и ramp-up.
+// При ramp-up TPS растёт линейно от 0 до base*percent/100.
 func effectiveTPS(cfg RunConfig, startedAt *time.Time) float64 {
 	base := cfg.BaseTPS * float64(cfg.Percent) / 100.0
 	if cfg.RampUpSeconds <= 0 || startedAt == nil {
@@ -315,6 +382,7 @@ func effectiveTPS(cfg RunConfig, startedAt *time.Time) float64 {
 	return base * progress
 }
 
+// runner исполняет одну итерацию сценария и держит локальные кэши клиентов.
 type runner struct {
 	httpClient  *http.Client
 	buildVars   func() map[string]string
@@ -322,8 +390,10 @@ type runner struct {
 	kafkaWriter map[string]*kafka.Writer
 	dbMu        sync.Mutex
 	dbPool      map[string]*sql.DB
+	requestSeq  uint64
 }
 
+// newRunner создаёт runner с переиспользуемыми HTTP/Kafka/DB-клиентами.
 func newRunner(buildVars func() map[string]string) *runner {
 	return &runner{
 		httpClient: &http.Client{
@@ -335,9 +405,18 @@ func newRunner(buildVars func() map[string]string) *runner {
 	}
 }
 
+// executeScenario выполняет все шаги сценария по порядку.
+// Если requestId не передан во входных variables, генерирует уникальный
+// requestId для текущей итерации.
 func (r *runner) executeScenario(sc scenario.Scenario) error {
+	vars := r.buildVars()
+	if strings.TrimSpace(vars["requestId"]) == "" {
+		seq := atomic.AddUint64(&r.requestSeq, 1)
+		vars["requestId"] = fmt.Sprintf("req-%d-%d", time.Now().UTC().UnixNano(), seq)
+	}
+
 	for _, step := range sc.Steps {
-		if err := r.executeStep(step); err != nil {
+		if err := r.executeStep(step, vars); err != nil {
 			name := step.Name
 			if name == "" {
 				name = step.Type
@@ -348,23 +427,24 @@ func (r *runner) executeScenario(sc scenario.Scenario) error {
 	return nil
 }
 
-func (r *runner) executeStep(step scenario.Step) error {
+// executeStep маршрутизирует выполнение в обработчик соответствующего типа.
+func (r *runner) executeStep(step scenario.Step, vars map[string]string) error {
 	switch step.Type {
 	case "rest":
-		return r.executeREST(step)
+		return r.executeREST(step, vars)
 	case "kafka":
-		return r.executeKafka(step)
+		return r.executeKafka(step, vars)
 	case "db":
-		return r.executeDB(step)
+		return r.executeDB(step, vars)
 	case "mq":
-		return errors.New("mq step is not implemented yet")
+		return r.executeMQ(step, vars)
 	default:
 		return fmt.Errorf("unsupported step type: %s", step.Type)
 	}
 }
 
-func (r *runner) executeREST(step scenario.Step) error {
-	vars := r.buildVars()
+// executeREST выполняет HTTP-запрос шага и проверяет assert.status при наличии.
+func (r *runner) executeREST(step scenario.Step, vars map[string]string) error {
 	method := strings.TrimSpace(step.Method)
 	if method == "" {
 		method = http.MethodPost
@@ -399,8 +479,8 @@ func (r *runner) executeREST(step scenario.Step) error {
 	return nil
 }
 
-func (r *runner) executeKafka(step scenario.Step) error {
-	vars := r.buildVars()
+// executeKafka отправляет одно сообщение в Kafka-топик шага.
+func (r *runner) executeKafka(step scenario.Step, vars map[string]string) error {
 	topic := interpolate(vars, step.Topic)
 	if topic == "" {
 		return errors.New("kafka topic is empty")
@@ -436,8 +516,8 @@ func (r *runner) executeKafka(step scenario.Step) error {
 	return nil
 }
 
-func (r *runner) executeDB(step scenario.Step) error {
-	vars := r.buildVars()
+// executeDB выполняет SQL-запрос и проверяет assert.rows (если задан).
+func (r *runner) executeDB(step scenario.Step, vars map[string]string) error {
 	dsn := interpolate(vars, step.DBDSN)
 	if dsn == "" {
 		return errors.New("db_dsn is empty")
@@ -480,6 +560,8 @@ func (r *runner) executeDB(step scenario.Step) error {
 	return nil
 }
 
+// bodyFromStep строит payload шага: сначала template (если задан),
+// иначе raw body с интерполяцией {{var}}.
 func (r *runner) bodyFromStep(step scenario.Step, vars map[string]string) (string, error) {
 	// If template name provided, render from templates/ using full var map.
 	if step.Template != "" {
@@ -497,6 +579,215 @@ func (r *runner) bodyFromStep(step scenario.Step, vars map[string]string) (strin
 	return interpolate(vars, step.Body), nil
 }
 
+// executeMQ выполняет mq put/get через Artemis STOMP factory.
+// Для get поддерживает циклическое чтение до timeout, пока не найдётся
+// сообщение, удовлетворяющее assert.
+func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
+	queue := interpolate(vars, step.Queue)
+	if queue == "" {
+		return errors.New("mq queue is empty")
+	}
+
+	connName := interpolate(vars, step.MQConnName)
+	channel := interpolate(vars, step.MQChannel)
+	qm := interpolate(vars, step.MQQueueMgr)
+	user := interpolate(vars, step.MQUser)
+	password := interpolate(vars, step.MQPassword)
+	action := strings.ToLower(strings.TrimSpace(step.MQAction))
+	if action == "" {
+		action = "put"
+	}
+
+	if connName == "" {
+		return errors.New("mq_conn_name is required for mq step")
+	}
+
+	// ActiveMQ Artemis via STOMP (mq_artemis.go)
+	cf := mqConnectionFactory{
+		ConnName: connName,
+		Channel:  channel,
+		QueueMgr: qm,
+		AppUser:  user,
+		AppPass:  password,
+	}
+
+	switch action {
+	case "put":
+		bodyStr, err := r.bodyFromStep(step, vars)
+		if err != nil {
+			return err
+		}
+		if bodyStr == "" {
+			return errors.New("mq put body is empty")
+		}
+		return cf.Put(queue, bodyStr)
+	case "get":
+		resolvedAssert := interpolateAssert(step.Assert, vars)
+		waitMS := step.MQWaitMS
+		if waitMS <= 0 {
+			waitMS = 15000
+		}
+		selector := interpolate(vars, step.MQSelector)
+		timeout := time.Duration(waitMS) * time.Millisecond
+		deadline := time.Now().Add(timeout)
+		var lastMismatch string
+
+		for {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				if lastMismatch != "" {
+					return fmt.Errorf("mq get: timeout waiting matching message; last mismatch: %s", lastMismatch)
+				}
+				return fmt.Errorf("mq get: no message within %v", timeout)
+			}
+
+			msg, err := cf.Get(queue, remaining, selector)
+			if err != nil {
+				if strings.Contains(err.Error(), "no message within") {
+					if lastMismatch != "" {
+						return fmt.Errorf("mq get: timeout waiting matching message; last mismatch: %s", lastMismatch)
+					}
+				}
+				return err
+			}
+			if msg == "" {
+				continue
+			}
+
+			if len(resolvedAssert) == 0 {
+				return nil
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(msg), &payload); err != nil {
+				lastMismatch = fmt.Sprintf("invalid JSON payload: %v", err)
+				continue
+			}
+
+			// success проверяем сразу после получения сообщения и на mismatch падаем сразу.
+			if ok, reason := checkMQSuccessAssert(payload, resolvedAssert); !ok {
+				return fmt.Errorf("mq assert failed: %s", reason)
+			}
+
+			ok, reason := matchesMQAssert(payload, resolvedAssert)
+			if ok {
+				return nil
+			}
+			lastMismatch = reason
+		}
+	default:
+		return fmt.Errorf("unsupported mq_action: %s", step.MQAction)
+	}
+}
+
+// matchesMQAssert сверяет текстовые поля корреляции (requestId/clientGuid).
+// Предусмотрены разные варианты регистра ключа RequestID в payload.
+func matchesMQAssert(payload map[string]any, assert map[string]any) (bool, string) {
+	// requestId / clientGuid точное сравнение строк
+	if wantReqID, ok := assert["requestId"].(string); ok && wantReqID != "" {
+		gotRaw, ok2 := payload["RequestID"]
+		if !ok2 {
+			gotRaw, ok2 = payload["requestID"]
+		}
+		if !ok2 {
+			gotRaw, ok2 = payload["requestId"]
+		}
+		got, ok3 := gotRaw.(string)
+		if !ok3 || got != wantReqID {
+			return false, fmt.Sprintf("RequestID=%q, want %q", got, wantReqID)
+		}
+	}
+	if wantClient, ok := assert["clientGuid"].(string); ok && wantClient != "" {
+		got, ok2 := payload["clientGuid"].(string)
+		if !ok2 || got != wantClient {
+			return false, fmt.Sprintf("clientGuid=%q, want %q", got, wantClient)
+		}
+	}
+
+	return true, ""
+}
+
+// checkMQSuccessAssert отдельно валидирует success-поле и даёт fast-fail.
+// Это позволяет не ждать timeout, если получили "неуспешный" ответ.
+func checkMQSuccessAssert(payload map[string]any, assert map[string]any) (bool, string) {
+	if assert == nil {
+		return true, ""
+	}
+	successExpected, hasSuccess := assert["success"]
+	if !hasSuccess {
+		return true, ""
+	}
+	successFieldName := "success"
+	if v, ok := assert["success_field"].(string); ok && v != "" {
+		successFieldName = v
+	}
+	got, ok := payload[successFieldName]
+	if !ok || !jsonEqual(got, successExpected) {
+		return false, fmt.Sprintf("%s=%v, want %v", successFieldName, got, successExpected)
+	}
+	return true, ""
+}
+
+// buildMQSelectorFromAssert строит broker-selector из assert-полей.
+// Сохранено для совместимости, даже если selector может быть отключён на клиенте.
+func buildMQSelectorFromAssert(assert map[string]any) string {
+	if assert == nil {
+		return ""
+	}
+	var parts []string
+	if wantClient, ok := assert["clientGuid"].(string); ok && wantClient != "" {
+		parts = append(parts, "clientGuid = '"+escapeSelectorString(wantClient)+"'")
+	}
+	if wantReqID, ok := assert["requestId"].(string); ok && wantReqID != "" {
+		escaped := escapeSelectorString(wantReqID)
+		parts = append(parts, "(requestId = '"+escaped+"' OR requestID = '"+escaped+"' OR RequestID = '"+escaped+"')")
+	}
+	return strings.Join(parts, " AND ")
+}
+
+// escapeSelectorString экранирует одинарные кавычки для STOMP selector.
+func escapeSelectorString(v string) string {
+	return strings.ReplaceAll(v, "'", "''")
+}
+
+// interpolateAssert применяет {{var}}-интерполяцию только к строковым полям assert.
+func interpolateAssert(assert map[string]any, vars map[string]string) map[string]any {
+	if assert == nil {
+		return nil
+	}
+	out := make(map[string]any, len(assert))
+	for k, v := range assert {
+		switch vv := v.(type) {
+		case string:
+			out[k] = interpolate(vars, vv)
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// jsonEqual сравнивает значения assert с учётом базовой типовой нормализации.
+func jsonEqual(a, b any) bool {
+	switch av := a.(type) {
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return av == bv
+		}
+	case float64:
+		switch bv := b.(type) {
+		case float64:
+			return av == bv
+		case int:
+			return av == float64(bv)
+		}
+	default:
+		return fmt.Sprint(a) == fmt.Sprint(b)
+	}
+	return fmt.Sprint(a) == fmt.Sprint(b)
+}
+
+// kafkaWriterFor возвращает кэшированный kafka.Writer по связке brokers+topic.
 func (r *runner) kafkaWriterFor(brokers []string, topic string) (*kafka.Writer, error) {
 	if len(brokers) == 0 {
 		return nil, errors.New("kafka brokers list is empty")
@@ -520,6 +811,8 @@ func (r *runner) kafkaWriterFor(brokers []string, topic string) (*kafka.Writer, 
 	return w, nil
 }
 
+// dbFor возвращает кэшированное подключение к БД по DSN.
+// При первом создании сразу делает Ping для ранней диагностики.
 func (r *runner) dbFor(dsn string) (*sql.DB, error) {
 	r.dbMu.Lock()
 	defer r.dbMu.Unlock()
@@ -549,6 +842,7 @@ func (r *runner) dbFor(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
+// interpolate подставляет значения variables в шаблоны вида {{key}}.
 func interpolate(vars map[string]string, src string) string {
 	out := src
 	for k, v := range vars {
@@ -557,6 +851,7 @@ func interpolate(vars map[string]string, src string) string {
 	return out
 }
 
+// getExpectedStatus извлекает assert.status в int с допуском разных типов YAML.
 func getExpectedStatus(assert map[string]any) (int, bool) {
 	if assert == nil {
 		return 0, false
@@ -583,6 +878,7 @@ func getExpectedStatus(assert map[string]any) (int, bool) {
 	}
 }
 
+// getExpectedRows извлекает assert.rows в int с допуском разных типов YAML.
 func getExpectedRows(assert map[string]any) (int, bool) {
 	if assert == nil {
 		return 0, false
@@ -609,6 +905,8 @@ func getExpectedRows(assert map[string]any) (int, bool) {
 	}
 }
 
+// buildVariables формирует базовый набор переменных итерации из Config.Variables
+// и служебных полей сценария.
 func (s *Service) buildVariables() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -620,4 +918,3 @@ func (s *Service) buildVariables() map[string]string {
 	vars["scenarioName"] = s.status.ScenarioName
 	return vars
 }
-

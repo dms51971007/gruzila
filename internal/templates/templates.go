@@ -9,16 +9,18 @@ import (
 	"text/template"
 )
 
-// simple in-memory cache for parsed templates from templates/ directory
+// Простейший in-memory cache распарсенных шаблонов из templates/.
+// Нужен, чтобы не читать и не парсить шаблон с диска на каждую итерацию.
 
 var (
-	mu       sync.RWMutex
-	tmpls    = make(map[string]*template.Template)
-	baseDir  = "templates"
-	funcs    = template.FuncMap{}
+	mu      sync.RWMutex
+	tmpls   = make(map[string]*template.Template)
+	baseDir = "templates"
+	funcs   = template.FuncMap{}
 )
 
-// SetBaseDir allows overriding templates directory (e.g. from CLI config).
+// SetBaseDir переопределяет базовый каталог шаблонов и сбрасывает cache.
+// Полезно для тестов и нестандартной структуры проекта.
 func SetBaseDir(dir string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -26,7 +28,8 @@ func SetBaseDir(dir string) {
 	tmpls = make(map[string]*template.Template)
 }
 
-// Render loads template by name from templates/ and executes it with data.
+// Render загружает шаблон по имени (с кэшированием) и применяет data.
+// Для снижения GC-нагрузки используется пул bytes.Buffer.
 func Render(name string, data map[string]any) (string, error) {
 	t, err := getTemplate(name)
 	if err != nil {
@@ -44,6 +47,8 @@ func Render(name string, data map[string]any) (string, error) {
 	return b.String(), nil
 }
 
+// getTemplate возвращает template.Template из cache либо читает/парсит
+// файл с диска и кладёт его в cache.
 func getTemplate(name string) (*template.Template, error) {
 	mu.RLock()
 	if t, ok := tmpls[name]; ok {
@@ -74,9 +79,9 @@ func getTemplate(name string) (*template.Template, error) {
 	return t, nil
 }
 
+// bytesBufferPool уменьшает аллокации при частом Render.
 var bytesBufferPool = sync.Pool{
 	New: func() any {
 		return &bytes.Buffer{}
 	},
 }
-

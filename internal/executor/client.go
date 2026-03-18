@@ -14,11 +14,14 @@ type APIResponse struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+// Client — простой HTTP-клиент для вызова API gruzilla-executor.
+// Используется в CLI-командах run/executors.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 }
 
+// NewClient создаёт клиент с фиксированным базовым URL и timeout.
 func NewClient(baseURL string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: baseURL,
@@ -28,6 +31,10 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 	}
 }
 
+// Call выполняет POST-запрос к path с JSON-телом и декодирует
+// стандартизованный APIResponse.
+// Метод не трактует status=error как transport-ошибку — это ответственность
+// вызывающего кода.
 func (c *Client) Call(path string, body any) (APIResponse, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -52,4 +59,3 @@ func (c *Client) Call(path string, body any) (APIResponse, error) {
 	}
 	return out, nil
 }
-

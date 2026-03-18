@@ -1,0 +1,31 @@
+# Сценарий: отправка запроса в topic1, чтение ответа, проверка success=true
+name: "mq-topic1-request-reply"
+description: "Put request to topic1, get reply, assert success=true"
+steps:
+  # 1. Отправка запроса в очередь topic1 (Artemis, JMS address=topic1)
+  - type: mq
+    name: "put-request-to-topic1"
+    mq_action: put
+    queue: "topic_1"
+    mq_conn_name: "localhost:61613"          # Artemis STOMP endpoint (см. docker-compose)
+    mq_channel: ""
+    mq_queue_manager: ""
+    mq_user: "artemis"
+    mq_password: "artemis"
+    body: '{"clientGuid":"550e8400-e29b-41d4-a716-446655440000","RequestID":"{{requestId}}"}'
+
+  # 2. Чтение ответа из очереди topic2 (JMS address=topic2), проверка success=true
+  - type: mq
+    name: "get-reply-check-success"
+    mq_action: get
+    queue: "topic_2_"
+    mq_selector: ""
+    mq_conn_name: "localhost:61613"
+    mq_channel: ""
+    mq_queue_manager: ""
+    mq_user: "artemis"
+    mq_password: "artemis"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "success"
+      success: true

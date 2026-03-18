@@ -4,7 +4,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// PrometheusMetrics хранит метрики Prometheus с лейблом scenario для обновления.
+// PrometheusMetrics хранит инстансы gauge-метрик, уже "привязанные"
+// к конкретному label scenario. Это убирает накладные расходы на поиск
+// метрик по labels при каждом тике runLoop.
 type PrometheusMetrics struct {
 	attempts    prometheus.Gauge
 	success     prometheus.Gauge
@@ -15,7 +17,9 @@ type PrometheusMetrics struct {
 	running     prometheus.Gauge
 }
 
-// InitPrometheusMetrics регистрирует метрики для сценария и возвращает объект для обновления.
+// InitPrometheusMetrics создаёт и регистрирует набор gauge-метрик для сценария.
+// Метрики сделаны gauge, чтобы прямо устанавливать актуальные значения counters/TPS
+// и не хранить дублирующее состояние в Prometheus-слое.
 func InitPrometheusMetrics(scenarioLabel string) *PrometheusMetrics {
 	const namespace = "gruzilla"
 	labels := prometheus.Labels{"scenario": scenarioLabel}

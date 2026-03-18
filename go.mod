@@ -3,6 +3,7 @@ module gruzilla
 go 1.25.0
 
 require (
+	github.com/go-stomp/stomp v2.1.4+incompatible
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/prometheus/client_golang v1.21.0
 	github.com/segmentio/kafka-go v0.4.50

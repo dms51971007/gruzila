@@ -9,16 +9,24 @@ import (
 )
 
 var (
-	ErrMissingName  = errors.New("scenario.name is required")
+	// ErrMissingName возвращается, если в YAML отсутствует scenario.name.
+	ErrMissingName = errors.New("scenario.name is required")
+	// ErrMissingSteps возвращается, если сценарий не содержит ни одного шага.
 	ErrMissingSteps = errors.New("scenario.steps is required")
 )
 
+// Scenario описывает корневую структуру YAML-сценария нагрузки.
+// Один Scenario состоит из последовательности шагов Step, которые
+// выполняются в указанном порядке в рамках одной итерации.
 type Scenario struct {
 	Name        string `yaml:"name" json:"name"`
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 	Steps       []Step `yaml:"steps" json:"steps"`
 }
 
+// Step описывает единичное действие сценария.
+// Поля сгруппированы по типам шагов (rest/kafka/db/mq), но лежат в одной
+// структуре для упрощения парсинга YAML и сериализации в API.
 type Step struct {
 	Type     string            `yaml:"type" json:"type"` // rest|kafka|db|mq
 	Name     string            `yaml:"name,omitempty" json:"name,omitempty"`
@@ -34,7 +42,15 @@ type Step struct {
 	Key     string   `yaml:"key,omitempty" json:"key,omitempty"`
 
 	// MQ (пока не реализовано)
-	Queue string `yaml:"queue,omitempty" json:"queue,omitempty"`
+	Queue      string `yaml:"queue,omitempty" json:"queue,omitempty"`
+	MQAction   string `yaml:"mq_action,omitempty" json:"mq_action,omitempty"` // put|get
+	MQSelector string `yaml:"mq_selector,omitempty" json:"mq_selector,omitempty"`
+	MQConnName string `yaml:"mq_conn_name,omitempty" json:"mq_conn_name,omitempty"`
+	MQChannel  string `yaml:"mq_channel,omitempty" json:"mq_channel,omitempty"`
+	MQQueueMgr string `yaml:"mq_queue_manager,omitempty" json:"mq_queue_manager,omitempty"`
+	MQUser     string `yaml:"mq_user,omitempty" json:"mq_user,omitempty"`
+	MQPassword string `yaml:"mq_password,omitempty" json:"mq_password,omitempty"`
+	MQWaitMS   int    `yaml:"mq_wait_ms,omitempty" json:"mq_wait_ms,omitempty"`
 
 	// DB check
 	DBDSN   string `yaml:"db_dsn,omitempty" json:"db_dsn,omitempty"`
@@ -43,6 +59,8 @@ type Step struct {
 	Assert map[string]any `yaml:"assert,omitempty" json:"assert,omitempty"`
 }
 
+// LoadFromFile читает YAML-файл сценария, десериализует его в структуру
+// Scenario и выполняет базовую валидацию обязательных полей.
 func LoadFromFile(path string) (Scenario, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -59,6 +77,11 @@ func LoadFromFile(path string) (Scenario, error) {
 	return sc, nil
 }
 
+// Validate проверяет минимальную корректность сценария:
+// - наличие имени и шагов;
+// - обязательные поля для каждого поддерживаемого типа шага.
+// Валидация намеренно остаётся "лёгкой": глубокие проверки выполняются
+// непосредственно в исполнителе соответствующего шага.
 func Validate(sc Scenario) error {
 	if sc.Name == "" {
 		return ErrMissingName
@@ -95,4 +118,3 @@ func Validate(sc Scenario) error {
 
 	return nil
 }
-

@@ -11,7 +11,9 @@ import (
 )
 
 func main() {
+	// scenario — путь к YAML, который executor держит как активный сценарий.
 	scenarioPath := flag.String("scenario", "", "path to scenario YAML file")
+	// addr — HTTP-адрес API executor (CLI обращается к нему через --executor-url).
 	addr := flag.String("addr", ":8081", "listen address, e.g. :8081")
 	flag.Parse()
 
@@ -29,6 +31,8 @@ func main() {
 	handler.Register(mux)
 
 	server := &http.Server{Addr: *addr, Handler: mux}
+	// Shutdown endpoint запускает graceful stop HTTP-сервера,
+	// чтобы executors restart мог корректно перезапустить процесс.
 	handler.SetShutdownFunc(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -42,4 +46,3 @@ func main() {
 		log.Fatalf("server stopped: %v", err)
 	}
 }
-
