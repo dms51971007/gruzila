@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -276,7 +277,7 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				}
 				go func() {
 					defer func() { <-inflightLimiter }()
-					s.attemptsCount.Add(1)
+					transactionNumber := s.attemptsCount.Add(1)
 					started := time.Now()
 					var err error
 					func() {
@@ -285,7 +286,7 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 								err = fmt.Errorf("panic: %v", p)
 							}
 						}()
-						err = r.executeScenario(s.active)
+						err = r.executeScenario(s.active, transactionNumber)
 					}()
 					latency := time.Since(started).Milliseconds()
 					s.lastLatency.Store(latency)
@@ -390,7 +391,6 @@ type runner struct {
 	kafkaWriter map[string]*kafka.Writer
 	dbMu        sync.Mutex
 	dbPool      map[string]*sql.DB
-	requestSeq  uint64
 }
 
 // newRunner создаёт runner с переиспользуемыми HTTP/Kafka/DB-клиентами.
@@ -406,14 +406,12 @@ func newRunner(buildVars func() map[string]string) *runner {
 }
 
 // executeScenario выполняет все шаги сценария по порядку.
-// Если requestId не передан во входных variables, генерирует уникальный
-// requestId для текущей итерации.
-func (r *runner) executeScenario(sc scenario.Scenario) error {
+// requestId всегда генерируется как UUID для каждой итерации и общий
+// для всех шагов этой итерации. TransactionNumber — номер попытки.
+func (r *runner) executeScenario(sc scenario.Scenario, transactionNumber int64) error {
 	vars := r.buildVars()
-	if strings.TrimSpace(vars["requestId"]) == "" {
-		seq := atomic.AddUint64(&r.requestSeq, 1)
-		vars["requestId"] = fmt.Sprintf("req-%d-%d", time.Now().UTC().UnixNano(), seq)
-	}
+	vars["requestId"] = newUUIDString()
+	vars["TransactionNumber"] = strconv.FormatInt(transactionNumber, 10)
 
 	for _, step := range sc.Steps {
 		if err := r.executeStep(step, vars); err != nil {
@@ -426,6 +424,26 @@ func (r *runner) executeScenario(sc scenario.Scenario) error {
 	}
 	return nil
 }
+
+func newUUIDString() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		seq := atomic.AddUint64(&uuidFallbackSeq, 1)
+		return fmt.Sprintf("req-%d-%d", time.Now().UTC().UnixNano(), seq)
+	}
+	// UUIDv4 bits.
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]),
+		uint16(b[4])<<8|uint16(b[5]),
+		uint16(b[6])<<8|uint16(b[7]),
+		uint16(b[8])<<8|uint16(b[9]),
+		uint64(b[10])<<40|uint64(b[11])<<32|uint64(b[12])<<24|uint64(b[13])<<16|uint64(b[14])<<8|uint64(b[15]),
+	)
+}
+
+var uuidFallbackSeq uint64
 
 // executeStep маршрутизирует выполнение в обработчик соответствующего типа.
 func (r *runner) executeStep(step scenario.Step, vars map[string]string) error {
@@ -620,14 +638,24 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 		if bodyStr == "" {
 			return errors.New("mq put body is empty")
 		}
-		return cf.Put(queue, bodyStr)
+		headers := interpolateStringMap(step.MQHeaders, vars)
+		// Сохраняем вычисленные headers в vars текущей итерации:
+		// это позволяет шагу mq.get использовать те же значения (например RequestId)
+		// для broker-side selector.
+		for k, v := range headers {
+			if strings.TrimSpace(k) == "" {
+				continue
+			}
+			vars[k] = v
+		}
+		return cf.Put(queue, bodyStr, headers)
 	case "get":
 		resolvedAssert := interpolateAssert(step.Assert, vars)
 		waitMS := step.MQWaitMS
 		if waitMS <= 0 {
 			waitMS = 15000
 		}
-		selector := interpolate(vars, step.MQSelector)
+		selector := buildArtemisSelector(interpolate(vars, step.MQSelector), vars)
 		timeout := time.Duration(waitMS) * time.Millisecond
 		deadline := time.Now().Add(timeout)
 		var lastMismatch string
@@ -641,7 +669,7 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 				return fmt.Errorf("mq get: no message within %v", timeout)
 			}
 
-			msg, err := cf.Get(queue, remaining, selector)
+			msg, _, err := cf.Get(queue, remaining, selector)
 			if err != nil {
 				if strings.Contains(err.Error(), "no message within") {
 					if lastMismatch != "" {
@@ -678,6 +706,44 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 	default:
 		return fmt.Errorf("unsupported mq_action: %s", step.MQAction)
 	}
+}
+
+// buildArtemisSelector готовит broker-side selector для SUBSCRIBE.
+// Если в mq_selector уже передано выражение (есть '='), используем как есть.
+// Иначе считаем, что это имя header-поля и строим выражение field = 'requestId'.
+func buildArtemisSelector(rawSelector string, vars map[string]string) string {
+	s := strings.TrimSpace(rawSelector)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "=") {
+		return s
+	}
+	selectorValue := selectorValueFromVars(s, vars)
+	if selectorValue == "" {
+		return ""
+	}
+	escaped := strings.ReplaceAll(selectorValue, "'", "''")
+	return fmt.Sprintf("%s = '%s'", s, escaped)
+}
+
+func selectorValueFromVars(selectorField string, vars map[string]string) string {
+	if len(vars) == 0 {
+		return ""
+	}
+	if v, ok := vars[selectorField]; ok && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	needle := strings.ToLower(strings.TrimSpace(selectorField))
+	for k, v := range vars {
+		if strings.ToLower(strings.TrimSpace(k)) == needle && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	if v := strings.TrimSpace(vars["requestId"]); v != "" {
+		return v
+	}
+	return ""
 }
 
 // matchesMQAssert сверяет текстовые поля корреляции (requestId/clientGuid).
@@ -847,6 +913,22 @@ func interpolate(vars map[string]string, src string) string {
 	out := src
 	for k, v := range vars {
 		out = strings.ReplaceAll(out, "{{"+k+"}}", v)
+		out = strings.ReplaceAll(out, "{"+k+"}", v)
+	}
+	return out
+}
+
+func interpolateStringMap(src map[string]string, vars map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		key := strings.TrimSpace(interpolate(vars, k))
+		if key == "" {
+			continue
+		}
+		out[key] = interpolate(vars, v)
 	}
 	return out
 }

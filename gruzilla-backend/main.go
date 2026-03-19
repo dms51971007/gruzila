@@ -24,23 +24,27 @@ type apiResponse struct {
 }
 
 type config struct {
-	Addr               string
-	CLICommand         string
-	CLIArgs            []string
-	CLIWorkDir         string
-	CLITimeoutSeconds  int
-	DefaultExecutorURL string
+	Addr                string
+	CLICommand          string
+	CLIArgs             []string
+	CLIWorkDir          string
+	CLITimeoutSeconds   int
+	DefaultExecutorURL  string
+	ExecutorLogsEnabled bool
+	ExecutorLogFile     string
 }
 
 type fileConfig struct {
 	Addr string `yaml:"addr"`
 	CLI  struct {
-		Command            string   `yaml:"command"`
-		Args               []string `yaml:"args"`
-		ArgsLine           string   `yaml:"args_line"`
-		WorkDir            string   `yaml:"workdir"`
-		TimeoutSeconds     int      `yaml:"timeout_seconds"`
-		DefaultExecutorURL string   `yaml:"default_executor_url"`
+		Command             string   `yaml:"command"`
+		Args                []string `yaml:"args"`
+		ArgsLine            string   `yaml:"args_line"`
+		WorkDir             string   `yaml:"workdir"`
+		TimeoutSeconds      int      `yaml:"timeout_seconds"`
+		DefaultExecutorURL  string   `yaml:"default_executor_url"`
+		ExecutorLogsEnabled *bool    `yaml:"executor_logs_enabled"`
+		ExecutorLogFile     string   `yaml:"executor_log_file"`
 	} `yaml:"cli"`
 }
 
@@ -115,12 +119,14 @@ func loadConfig(configPath string) config {
 
 	// Base defaults.
 	cfg := config{
-		Addr:               ":8080",
-		CLICommand:         "go",
-		CLIArgs:            []string{"run", "./cmd/gruzilla-cli"},
-		CLIWorkDir:         ".",
-		CLITimeoutSeconds:  30,
-		DefaultExecutorURL: "http://localhost:8081",
+		Addr:                ":8080",
+		CLICommand:          "go",
+		CLIArgs:             []string{"run", "./cmd/gruzilla-cli"},
+		CLIWorkDir:          ".",
+		CLITimeoutSeconds:   30,
+		DefaultExecutorURL:  "http://localhost:8081",
+		ExecutorLogsEnabled: false,
+		ExecutorLogFile:     "logs/executor-{addr}.log",
 	}
 
 	// Optional config YAML.
@@ -154,10 +160,16 @@ func loadConfig(configPath string) config {
 	if v := strings.TrimSpace(os.Getenv("GRUZILLA_DEFAULT_EXECUTOR_URL")); v != "" {
 		cfg.DefaultExecutorURL = v
 	}
+	if v := strings.TrimSpace(os.Getenv("GRUZILLA_EXECUTOR_LOGS_ENABLED")); v != "" {
+		cfg.ExecutorLogsEnabled = parseBoolish(v, cfg.ExecutorLogsEnabled)
+	}
+	if v := strings.TrimSpace(os.Getenv("GRUZILLA_EXECUTOR_LOG_FILE")); v != "" {
+		cfg.ExecutorLogFile = v
+	}
 	cfg.CLIWorkDir = resolveCLIWorkDir(cfg.CLIWorkDir, absConfigPath)
 
-	log.Printf("config loaded: addr=%s cli=%s args=%v workdir=%s timeout=%ds default_executor_url=%s",
-		cfg.Addr, cfg.CLICommand, cfg.CLIArgs, cfg.CLIWorkDir, cfg.CLITimeoutSeconds, cfg.DefaultExecutorURL)
+	log.Printf("config loaded: addr=%s cli=%s args=%v workdir=%s timeout=%ds default_executor_url=%s executor_logs_enabled=%t executor_log_file=%s",
+		cfg.Addr, cfg.CLICommand, cfg.CLIArgs, cfg.CLIWorkDir, cfg.CLITimeoutSeconds, cfg.DefaultExecutorURL, cfg.ExecutorLogsEnabled, cfg.ExecutorLogFile)
 
 	return cfg
 }
@@ -183,6 +195,12 @@ func applyFileConfig(cfg *config, fc fileConfig) {
 	if strings.TrimSpace(fc.CLI.DefaultExecutorURL) != "" {
 		cfg.DefaultExecutorURL = strings.TrimSpace(fc.CLI.DefaultExecutorURL)
 	}
+	if fc.CLI.ExecutorLogsEnabled != nil {
+		cfg.ExecutorLogsEnabled = *fc.CLI.ExecutorLogsEnabled
+	}
+	if strings.TrimSpace(fc.CLI.ExecutorLogFile) != "" {
+		cfg.ExecutorLogFile = strings.TrimSpace(fc.CLI.ExecutorLogFile)
+	}
 }
 
 func parsePositiveInt(s string, fallback int) int {
@@ -191,6 +209,17 @@ func parsePositiveInt(s string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func parseBoolish(s string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on", "enabled":
+		return true
+	case "0", "false", "no", "off", "disabled":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func resolveCLIWorkDir(rawWorkDir, absConfigPath string) string {
@@ -298,6 +327,7 @@ type executorsBody struct {
 	Scenario    string `json:"scenario"`
 	Addr        string `json:"addr"`
 	Bin         string `json:"bin"`
+	LogFile     string `json:"log_file"`
 	ExecutorURL string `json:"executor_url"`
 	PID         int    `json:"pid"`
 }
@@ -401,6 +431,13 @@ func (h *handler) executorsStart(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(body.Bin) != "" {
 		args = append(args, "--bin", strings.TrimSpace(body.Bin))
 	}
+	if strings.TrimSpace(body.LogFile) != "" {
+		args = append(args, "--log-file", strings.TrimSpace(body.LogFile))
+	} else if h.cfg.ExecutorLogsEnabled {
+		if p := h.defaultExecutorLogFile(body.Addr); p != "" {
+			args = append(args, "--log-file", p)
+		}
+	}
 	h.execCLIAndWrite(w, reqID, args...)
 }
 
@@ -453,10 +490,30 @@ func (h *handler) executorsRestart(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(body.Bin) != "" {
 		args = append(args, "--bin", strings.TrimSpace(body.Bin))
 	}
+	if strings.TrimSpace(body.LogFile) != "" {
+		args = append(args, "--log-file", strings.TrimSpace(body.LogFile))
+	} else if h.cfg.ExecutorLogsEnabled {
+		if p := h.defaultExecutorLogFile(body.Addr); p != "" {
+			args = append(args, "--log-file", p)
+		}
+	}
 	if strings.TrimSpace(body.ExecutorURL) != "" {
 		args = append(args, "--executor-url", strings.TrimSpace(body.ExecutorURL))
 	}
 	h.execCLIAndWrite(w, reqID, args...)
+}
+
+func (h *handler) defaultExecutorLogFile(addr string) string {
+	base := strings.TrimSpace(h.cfg.ExecutorLogFile)
+	if base == "" {
+		return ""
+	}
+	resolvedAddr := strings.TrimSpace(addr)
+	if resolvedAddr == "" {
+		resolvedAddr = ":8081"
+	}
+	safeAddr := strings.NewReplacer(":", "_", "/", "_", "\\", "_").Replace(resolvedAddr)
+	return strings.ReplaceAll(base, "{addr}", safeAddr)
 }
 
 func (h *handler) extractExecutorURL(r *http.Request) string {

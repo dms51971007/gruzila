@@ -890,6 +890,7 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 	var scenarioPath string
 	var addr string
 	var bin string
+	var logFile string
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -921,6 +922,9 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 				execCmd = bin
 				execArgs = []string{"--scenario", scenarioPath, "--addr", addr}
 			}
+			if strings.TrimSpace(logFile) != "" {
+				execArgs = append(execArgs, "--log-file", strings.TrimSpace(logFile))
+			}
 
 			proc := exec.Command(execCmd, execArgs...)
 			// Для backend (--output json) не наследуем консольные потоки,
@@ -946,6 +950,7 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 	cmd.Flags().StringVar(&scenarioPath, "scenario", "", "path to .yml scenario file")
 	cmd.Flags().StringVar(&addr, "addr", ":8081", "listen address for executor (e.g. :8081)")
 	cmd.Flags().StringVar(&bin, "bin", "go", "executor binary or 'go' to use 'go run ./cmd/gruzilla-executor'")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "optional path to executor log file")
 
 	return cmd
 }
@@ -957,6 +962,7 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 	var addr string
 	var bin string
 	var executorURL string
+	var logFile string
 
 	cmd := &cobra.Command{
 		Use:   "restart",
@@ -986,6 +992,9 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 				execCmd = bin
 				execArgs = []string{"--scenario", scenarioPath, "--addr", addr}
 			}
+			if strings.TrimSpace(logFile) != "" {
+				execArgs = append(execArgs, "--log-file", strings.TrimSpace(logFile))
+			}
 			proc := exec.Command(execCmd, execArgs...)
 			if strings.EqualFold(strings.TrimSpace(*output), "text") {
 				proc.Stdout = os.Stdout
@@ -1006,6 +1015,7 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 	cmd.Flags().StringVar(&addr, "addr", ":8081", "listen address for executor")
 	cmd.Flags().StringVar(&bin, "bin", "go", "executor binary or 'go' for go run")
 	cmd.Flags().StringVar(&executorURL, "executor-url", "", "URL of running executor to shutdown (default http://localhost<addr>)")
+	cmd.Flags().StringVar(&logFile, "log-file", "", "optional path to executor log file")
 	return cmd
 }
 

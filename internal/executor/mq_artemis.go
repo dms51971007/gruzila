@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-stomp/stomp"
+	"github.com/go-stomp/stomp/frame"
 )
 
 // mqConnectionFactory реализует работу с ActiveMQ Artemis через STOMP.
@@ -246,45 +247,62 @@ func (m mqConnectionFactory) invalidateAllConns() {
 	artemisSubCache.mu.Unlock()
 }
 
-// subCacheKey формирует ключ cache для подписки на destination.
-func (m mqConnectionFactory) subCacheKey(dest string) string {
-	return m.connCacheKey() + "|" + dest
+// subCacheKey формирует ключ cache для подписки на destination+selector.
+// Это важно: для разных selector должны быть разные subscription.
+func (m mqConnectionFactory) subCacheKey(dest string, selector string) string {
+	return m.connCacheKey() + "|" + dest + "|" + strings.TrimSpace(selector)
 }
 
-// getOrCreateSub возвращает кэшированную STOMP-подписку или создаёт новую.
-// Клиентский selector intentionally disabled, чтобы не создавать sticky-filter
-// артефакты на брокере.
-func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stomp.Subscription, error) {
-	key := m.subCacheKey(dest)
+// getOrCreateSub возвращает подписку для destination.
+// Если selector пустой — используется кэш shared-подписок.
+// Если selector задан — создаётся временная подписка без кэша (ephemeral),
+// чтобы не накапливать consumers при динамических selector.
+func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stomp.Subscription, bool, error) {
+	key := m.subCacheKey(dest, selector)
+	selector = strings.TrimSpace(selector)
+
+	// Dynamic selector -> always create ephemeral subscription.
+	if selector != "" {
+		conn, err := m.getOrCreateConn()
+		if err != nil {
+			return nil, false, err
+		}
+		sub, err := conn.Subscribe(dest, stomp.AckAuto, stomp.SubscribeOpt.Header("selector", selector))
+		if err != nil {
+			m.invalidateConn(conn)
+			return nil, false, fmt.Errorf("artemis subscribe %s with selector %q: %w", dest, selector, err)
+		}
+		return sub, true, nil
+	}
 
 	artemisSubCache.mu.Lock()
 	if sub, ok := artemisSubCache.subs[key]; ok && sub != nil {
 		artemisSubCache.mu.Unlock()
-		return sub, nil
+		return sub, false, nil
 	}
 	artemisSubCache.mu.Unlock()
 
 	conn, err := m.getOrCreateConn()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	_ = selector // Broker selector is intentionally disabled at client side.
-	sub, err := conn.Subscribe(dest, stomp.AckAuto)
+	var sub *stomp.Subscription
+	sub, err = conn.Subscribe(dest, stomp.AckAuto)
 	if err != nil {
 		m.invalidateConn(conn)
-		return nil, fmt.Errorf("artemis subscribe %s: %w", dest, err)
+		return nil, false, fmt.Errorf("artemis subscribe %s: %w", dest, err)
 	}
 
 	artemisSubCache.mu.Lock()
 	if existing, ok := artemisSubCache.subs[key]; ok && existing != nil {
 		artemisSubCache.mu.Unlock()
 		_ = sub.Unsubscribe()
-		return existing, nil
+		return existing, false, nil
 	}
 	artemisSubCache.subs[key] = sub
 	artemisSubCache.mu.Unlock()
-	return sub, nil
+	return sub, false, nil
 }
 
 // destination преобразует имя очереди из сценария в STOMP destination.
@@ -303,7 +321,8 @@ func (m mqConnectionFactory) destination(queueName string) string {
 }
 
 // Put отправляет JSON payload в destination через pooled STOMP connection.
-func (m mqConnectionFactory) Put(queueName string, payload string) error {
+// Дополнительные заголовки передаются через mq_headers шага.
+func (m mqConnectionFactory) Put(queueName string, payload string, headers map[string]string) error {
 	conn, err := m.getOrCreatePutConn()
 	if err != nil {
 		return err
@@ -315,7 +334,15 @@ func (m mqConnectionFactory) Put(queueName string, payload string) error {
 	}
 
 	//	log.Printf("[mq] send start destination=%s payload_size=%d", dest, len(payload))
-	if err := conn.Send(dest, "application/json", []byte(payload)); err != nil {
+	opts := make([]func(*frame.Frame) error, 0, len(headers))
+	for k, v := range headers {
+		key := strings.TrimSpace(k)
+		if key == "" {
+			continue
+		}
+		opts = append(opts, stomp.SendOpt.Header(key, v))
+	}
+	if err := conn.Send(dest, "application/json", []byte(payload), opts...); err != nil {
 		m.invalidateConn(conn)
 		log.Printf("[mq] send error destination=%s err=%v", dest, err)
 		return fmt.Errorf("artemis send to %s: %w", dest, err)
@@ -325,34 +352,67 @@ func (m mqConnectionFactory) Put(queueName string, payload string) error {
 }
 
 // Get ждёт сообщение из destination до указанного timeout.
+// Возвращает body и headers полученного сообщения.
 // На transport/subscription ошибках сбрасывает кэши для последующего reconnect.
-func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector string) (string, error) {
+func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector string) (string, map[string]string, error) {
 	dest := m.destination(queueName)
 	if dest == "" {
-		return "", fmt.Errorf("empty artemis destination")
+		return "", nil, fmt.Errorf("empty artemis destination")
 	}
 
-	sub, err := m.getOrCreateSub(dest, selector)
+	sub, ephemeral, err := m.getOrCreateSub(dest, selector)
 	if err != nil {
-		return "", err
+		return "", nil, err
+	}
+	if ephemeral {
+		defer func() { _ = sub.Unsubscribe() }()
 	}
 
 	timeout := time.After(wait)
 	for {
 		select {
 		case <-timeout:
-			return "", fmt.Errorf("artemis get: no message within %v", wait)
+			return "", nil, fmt.Errorf("artemis get: no message within %v", wait)
 		case msg := <-sub.C:
 			if msg == nil {
 				// Subscription channel closed: drop caches and reconnect path on next call.
 				m.invalidateAllConns()
-				return "", fmt.Errorf("artemis get: nil frame")
+				return "", nil, fmt.Errorf("artemis get: nil frame")
 			}
 			if msg.Err != nil {
 				m.invalidateAllConns()
-				return "", fmt.Errorf("artemis get frame error: %w", msg.Err)
+				return "", nil, fmt.Errorf("artemis get frame error: %w", msg.Err)
 			}
-			return string(msg.Body), nil
+			headers := stompHeaderToMap(msg.Header)
+			log.Printf(
+				"[mq] get message destination=%s headers=%v body=%s",
+				dest,
+				headers,
+				truncateForLog(string(msg.Body), 2048),
+			)
+			return string(msg.Body), headers, nil
 		}
 	}
+}
+
+func truncateForLog(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "...(truncated)"
+}
+
+func stompHeaderToMap(h *frame.Header) map[string]string {
+	if h == nil || h.Len() == 0 {
+		return nil
+	}
+	out := make(map[string]string, h.Len())
+	for i := 0; i < h.Len(); i++ {
+		k, v := h.GetAt(i)
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }

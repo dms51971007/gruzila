@@ -12,6 +12,13 @@ steps:
     mq_queue_manager: ""
     mq_user: "artemis"
     mq_password: "artemis"
+    mq_headers:
+      JMSMessageID: "{requestId}"
+      X_From: "gruzilla"
+      X_ServiceID: "service"
+      X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
+      X_Custom_Env: "serviceEnv"
+      RequestId: "gruzilla-{TransactionNumber}-{requestId}"
     body: '{"clientGuid":"550e8400-e29b-41d4-a716-446655440000","RequestID":"{{requestId}}"}'
 
   # 2. Чтение ответа из очереди topic2 (JMS address=topic2), проверка success=true
@@ -19,7 +26,7 @@ steps:
     name: "get-reply-check-success"
     mq_action: get
     queue: "topic_2_"
-    mq_selector: ""
+    mq_selector: "RequestId"
     mq_conn_name: "localhost:61613"
     mq_channel: ""
     mq_queue_manager: ""

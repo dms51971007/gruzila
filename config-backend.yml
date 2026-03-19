@@ -7,3 +7,5 @@ cli:
   workdir: "."
   timeout_seconds: 30
   default_executor_url: "http://localhost:8081"
+  executor_logs_enabled: true
+  executor_log_file: "logs/executor-{addr}.log"
