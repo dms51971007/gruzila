@@ -342,7 +342,7 @@ func (m mqConnectionFactory) Put(queueName string, payload string, headers map[s
 		}
 		opts = append(opts, stomp.SendOpt.Header(key, v))
 	}
-	if err := conn.Send(dest, "application/json", []byte(payload), opts...); err != nil {
+	if err := conn.Send(dest, "text/plain", []byte(payload), opts...); err != nil {
 		m.invalidateConn(conn)
 		log.Printf("[mq] send error destination=%s err=%v", dest, err)
 		return fmt.Errorf("artemis send to %s: %w", dest, err)
