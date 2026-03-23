@@ -65,6 +65,7 @@ type Service struct {
 	mu            sync.RWMutex
 	status        Status
 	active        scenario.Scenario
+	executorID    string
 	stopCh        chan struct{}
 	running       bool
 	attemptsCount atomic.Int64
@@ -96,8 +97,9 @@ func NewService(scenarioPath string) (*Service, error) {
 				BaseTPS: 1,
 			},
 		},
-		active: sc,
-		prom:   InitPrometheusMetrics(scenarioPath),
+		active:     sc,
+		executorID: newUUIDString(),
+		prom:       InitPrometheusMetrics(scenarioPath),
 	}, nil
 }
 
@@ -334,12 +336,11 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 	}()
 
 	// Интервал для TPS — между началами обработки соседних тиков (wall clock), иначе
-	// длительная работа тика смещает окно и «ломает» скорость/адаптацию.
+	// длительная работа тика смещает окно и «ломает» скорость.
 	var lastTPSSampleAt time.Time
 	// carryIterations хранит дробный "остаток" iterations между тиками,
 	// чтобы корректно поддерживать targetTPS < 1 и не терять точность.
 	carryIterations := 0.0
-	adaptiveCapTPS := 0.0
 
 	for {
 		select {
@@ -375,18 +376,10 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 					desiredTPS = 0
 				}
 				if s.resetAdaptiveCap.Swap(false) {
-					adaptiveCapTPS = desiredTPS
 					// При резком изменении TPS не переносим старый дробный "хвост".
 					carryIterations = 0
 				}
-				if adaptiveCapTPS <= 0 || math.IsNaN(adaptiveCapTPS) || math.IsInf(adaptiveCapTPS, 0) {
-					adaptiveCapTPS = desiredTPS
-				}
-				// Effective target is capped by what the system has recently sustained.
 				targetTPS := desiredTPS
-				if adaptiveCapTPS > 0 && targetTPS > adaptiveCapTPS {
-					targetTPS = adaptiveCapTPS
-				}
 
 				// Планируем количество запусков по фактическому временному окну.
 				// Это исправляет искажение TPS на дробных значениях (например 0.2, 0.5, 1.7).
@@ -416,28 +409,8 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				prevAttempts := s.lastAttempts.Swap(currentAttempts)
 				currentTPS := float64(currentAttempts-prevAttempts) / elapsedSec
 
-				// Adapt cap with bounded decay/recovery.
-				// Important: never drop cap to a single noisy sample instantly.
-				if currentTPS < targetTPS*0.95 {
-					decayed := adaptiveCapTPS * 0.85 // max 15% drop per cycle
-					if currentTPS > 0 && decayed < currentTPS {
-						decayed = currentTPS
-					}
-					if decayed < 1 {
-						decayed = 1
-					}
-					adaptiveCapTPS = decayed
-				} else {
-					// recover faster than before to avoid being stuck too low
-					grow := adaptiveCapTPS*1.2 + 1
-					if grow < 1 {
-						grow = 1
-					}
-					adaptiveCapTPS = math.Min(desiredTPS, grow)
-				}
-
 				s.mu.Lock()
-				s.status.Metrics.AdaptiveTPS = adaptiveCapTPS
+				s.status.Metrics.AdaptiveTPS = desiredTPS
 				s.status.Metrics.TargetTPS = targetTPS
 				s.status.Metrics.CurrentTPS = currentTPS
 				s.mu.Unlock()
@@ -1150,9 +1123,9 @@ func getExpectedRows(assert map[string]any) (int, bool) {
 // refreshBaseVarsSnapshotLocked обновляет снимок переменных сценария (без requestId / TransactionNumber).
 // Должно вызываться под s.mu (write lock).
 func (s *Service) refreshBaseVarsSnapshotLocked() {
-	n := len(s.status.Config.Variables) + 2
-	if n < 2 {
-		n = 2
+	n := len(s.status.Config.Variables) + 3
+	if n < 3 {
+		n = 3
 	}
 	m := make(map[string]string, n)
 	for k, v := range s.status.Config.Variables {
@@ -1160,6 +1133,7 @@ func (s *Service) refreshBaseVarsSnapshotLocked() {
 	}
 	m["scenarioPath"] = s.status.ScenarioPath
 	m["scenarioName"] = s.status.ScenarioName
+	m["executorId"] = s.executorID
 	s.baseVarsSnapshot = m
 }
 

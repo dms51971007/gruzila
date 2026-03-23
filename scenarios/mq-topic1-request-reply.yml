@@ -15,7 +15,7 @@ steps:
     mq_headers:
       JMSMessageID: "{requestId}"
       X_From: "gruzilla"
-      X_ServiceID: "service"
+      X_ServiceID: "service-{executorId}"
       X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
       X_Custom_Env: "serviceEnv"
       RequestId: "gruzilla-{TransactionNumber}-{requestId}"
@@ -27,7 +27,7 @@ steps:
     name: "get-reply-check-success"
     mq_action: get
     queue: "topic_2_"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_conn_name: "localhost:61613"
     mq_channel: ""
     mq_queue_manager: ""

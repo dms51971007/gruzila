@@ -253,56 +253,47 @@ func (m mqConnectionFactory) subCacheKey(dest string, selector string) string {
 	return m.connCacheKey() + "|" + dest + "|" + strings.TrimSpace(selector)
 }
 
-// getOrCreateSub возвращает подписку для destination.
-// Если selector пустой — используется кэш shared-подписок.
-// Если selector задан — создаётся временная подписка без кэша (ephemeral),
-// чтобы не накапливать consumers при динамических selector.
-func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stomp.Subscription, bool, error) {
+// getOrCreateSub возвращает кэшированную подписку для destination+selector.
+// Для одинакового selector внутри executor переиспользуется один listener.
+func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stomp.Subscription, error) {
 	key := m.subCacheKey(dest, selector)
 	selector = strings.TrimSpace(selector)
-
-	// Dynamic selector -> always create ephemeral subscription.
-	if selector != "" {
-		conn, err := m.getOrCreateConn()
-		if err != nil {
-			return nil, false, err
-		}
-		sub, err := conn.Subscribe(dest, stomp.AckAuto, stomp.SubscribeOpt.Header("selector", selector))
-		if err != nil {
-			m.invalidateConn(conn)
-			return nil, false, fmt.Errorf("artemis subscribe %s with selector %q: %w", dest, selector, err)
-		}
-		return sub, true, nil
-	}
 
 	artemisSubCache.mu.Lock()
 	if sub, ok := artemisSubCache.subs[key]; ok && sub != nil {
 		artemisSubCache.mu.Unlock()
-		return sub, false, nil
+		return sub, nil
 	}
 	artemisSubCache.mu.Unlock()
 
 	conn, err := m.getOrCreateConn()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	var sub *stomp.Subscription
-	sub, err = conn.Subscribe(dest, stomp.AckAuto)
+	if selector != "" {
+		sub, err = conn.Subscribe(dest, stomp.AckAuto, stomp.SubscribeOpt.Header("selector", selector))
+	} else {
+		sub, err = conn.Subscribe(dest, stomp.AckAuto)
+	}
 	if err != nil {
 		m.invalidateConn(conn)
-		return nil, false, fmt.Errorf("artemis subscribe %s: %w", dest, err)
+		if selector != "" {
+			return nil, fmt.Errorf("artemis subscribe %s with selector %q: %w", dest, selector, err)
+		}
+		return nil, fmt.Errorf("artemis subscribe %s: %w", dest, err)
 	}
 
 	artemisSubCache.mu.Lock()
 	if existing, ok := artemisSubCache.subs[key]; ok && existing != nil {
 		artemisSubCache.mu.Unlock()
 		_ = sub.Unsubscribe()
-		return existing, false, nil
+		return existing, nil
 	}
 	artemisSubCache.subs[key] = sub
 	artemisSubCache.mu.Unlock()
-	return sub, false, nil
+	return sub, nil
 }
 
 // destination преобразует имя очереди из сценария в STOMP destination.
@@ -364,12 +355,9 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 		return "", nil, fmt.Errorf("empty artemis destination")
 	}
 
-	sub, ephemeral, err := m.getOrCreateSub(dest, selector)
+	sub, err := m.getOrCreateSub(dest, selector)
 	if err != nil {
 		return "", nil, err
-	}
-	if ephemeral {
-		defer func() { _ = sub.Unsubscribe() }()
 	}
 
 	timeout := time.After(wait)
