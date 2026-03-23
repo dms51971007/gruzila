@@ -19,6 +19,7 @@ steps:
       X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
       X_Custom_Env: "serviceEnv"
       RequestId: "gruzilla-{TransactionNumber}-{requestId}"
+      X_MsgId: "{requestId}"
     body: '{"clientGuid":"550e8400-e29b-41d4-a716-446655440000","RequestID":"{{requestId}}"}'
 
   # 2. Чтение ответа из очереди topic2 (JMS address=topic2), проверка success=true
@@ -34,5 +35,5 @@ steps:
     mq_password: "artemis"
     mq_wait_ms: 15000
     assert:
-      success_field: "success"
-      success: true
+      success_field: "status"
+      success: "success"
