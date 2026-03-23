@@ -28,13 +28,14 @@ type Scenario struct {
 // Поля сгруппированы по типам шагов (rest/kafka/db/mq), но лежат в одной
 // структуре для упрощения парсинга YAML и сериализации в API.
 type Step struct {
-	Type     string            `yaml:"type" json:"type"` // rest|kafka|db|mq
-	Name     string            `yaml:"name,omitempty" json:"name,omitempty"`
-	Method   string            `yaml:"method,omitempty" json:"method,omitempty"`
-	URL      string            `yaml:"url,omitempty" json:"url,omitempty"`
-	Body     string            `yaml:"body,omitempty" json:"body,omitempty"`
-	Template string            `yaml:"template,omitempty" json:"template,omitempty"`
-	Headers  map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Type     string `yaml:"type" json:"type"` // rest|kafka|db|mq
+	Name     string `yaml:"name,omitempty" json:"name,omitempty"`
+	Method   string `yaml:"method,omitempty" json:"method,omitempty"`
+	URL      string `yaml:"url,omitempty" json:"url,omitempty"`
+	Body     string `yaml:"body,omitempty" json:"body,omitempty"`
+	Template string `yaml:"template,omitempty" json:"template,omitempty"`
+	// Headers: для rest — HTTP-заголовки; для mq put дополнительно сливаются с mq_headers (см. executor).
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
 	// Kafka
 	Topic   string   `yaml:"topic,omitempty" json:"topic,omitempty"`

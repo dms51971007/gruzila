@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,6 +73,9 @@ type Service struct {
 	lastLatency   atomic.Int64
 	lastAttempts  atomic.Int64
 	prom          *PrometheusMetrics
+	// baseVarsSnapshot — неизменяемый снимок Config.Variables + scenarioPath/scenarioName.
+	// Пересобирается в Start и Reload; buildVariables отдаёт maps.Clone для итерации (mq мутирует vars).
+	baseVarsSnapshot map[string]string
 }
 
 // NewService загружает сценарий с диска и инициализирует Service.
@@ -110,6 +116,7 @@ func (s *Service) Start(cfg RunConfig) error {
 	s.status.Config = cfg
 	s.status.Running = true
 	s.status.StartedAt = &now
+	s.refreshBaseVarsSnapshotLocked()
 	s.stopCh = make(chan struct{})
 	s.running = true
 	s.attemptsCount.Store(0)
@@ -162,6 +169,7 @@ func (s *Service) Update(cfg RunConfig) error {
 	if cfg.RampUpSeconds > 0 {
 		s.status.Config.RampUpSeconds = cfg.RampUpSeconds
 	}
+	// Если позже добавят обновление cfg.Variables через Update — вызвать refreshBaseVarsSnapshotLocked().
 	return nil
 }
 
@@ -226,130 +234,196 @@ func (s *Service) Reload() error {
 	// Сбрасывать или нет метрики/ошибки — решение на уровне продукта.
 	// Здесь только очищаем last_error, чтобы новые ошибки относились к новому сценарию.
 	s.status.LastError = ""
+	s.refreshBaseVarsSnapshotLocked()
 	s.mu.Unlock()
 
 	return nil
 }
 
+// scenarioMaxConcurrent — максимум сценариев «в полёте» (очередь + выполнение),
+// как раньше у inflightLimiter; ёмкость семафора и jobCh.
+const scenarioMaxConcurrent = 4096
+
+// scenarioWorkerCount — число долгоживущих воркеров (не создаём go на каждый тик).
+func scenarioWorkerCount() int {
+	n := runtime.GOMAXPROCS(0) * 2
+	if n < 4 {
+		n = 4
+	}
+	if n > 1024 {
+		n = 1024
+	}
+	return n
+}
+
+// runScenarioIteration выполняет одну попытку сценария (счётчики, panic recover, last_error).
+func (s *Service) runScenarioIteration(r *runner) {
+	transactionNumber := s.attemptsCount.Add(1)
+	started := time.Now()
+	var err error
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v", p)
+			}
+		}()
+		err = r.executeScenario(s.active, transactionNumber)
+	}()
+	latency := time.Since(started).Milliseconds()
+	s.lastLatency.Store(latency)
+
+	if err != nil {
+		s.errorCount.Add(1)
+		s.mu.Lock()
+		s.status.LastError = err.Error()
+		s.mu.Unlock()
+		return
+	}
+	s.successCount.Add(1)
+}
+
+func (s *Service) scenarioWorker(r *runner, jobCh <-chan struct{}, sem chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for range jobCh {
+		s.runScenarioIteration(r)
+		<-sem
+	}
+}
+
 // runLoop — основной цикл планирования нагрузки (тик раз в секунду).
 // На каждом тике:
 // 1) рассчитывает desired/target TPS;
-// 2) запускает нужное число итераций сценария (без блокирующего wait batch);
+// 2) ставит задачи в очередь воркерам (без go на каждую итерацию);
 // 3) пересчитывает current TPS и adaptive cap;
 // 4) обновляет status и Prometheus-метрики.
 func (s *Service) runLoop(stop <-chan struct{}) {
 	r := newRunner(s.buildVariables)
 
+	// sem: слот занят с постановки в очередь до завершения воркером (как старый inflightLimiter).
+	sem := make(chan struct{}, scenarioMaxConcurrent)
+	jobCh := make(chan struct{}, scenarioMaxConcurrent)
+	var workerWG sync.WaitGroup
+	for w := 0; w < scenarioWorkerCount(); w++ {
+		workerWG.Add(1)
+		go s.scenarioWorker(r, jobCh, sem, &workerWG)
+	}
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	lastTPSSampleAt := time.Now()
+	defer func() {
+		close(jobCh)
+		workerWG.Wait()
+	}()
+
+	// Интервал для TPS — между началами обработки соседних тиков (wall clock), иначе
+	// длительная работа тика смещает окно и «ломает» скорость/адаптацию.
+	var lastTPSSampleAt time.Time
 	adaptiveCapTPS := 0.0
-	// Ограничиваем число одновременных попыток, но не блокируем runLoop ожиданием batch.
-	inflightLimiter := make(chan struct{}, 4096)
 
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
-			cfg, startedAt := s.currentConfig()
-			desiredTPS := effectiveTPS(cfg, startedAt)
-			if adaptiveCapTPS <= 0 {
-				adaptiveCapTPS = desiredTPS
-			}
-			// Effective target is capped by what the system has recently sustained.
-			targetTPS := desiredTPS
-			if adaptiveCapTPS > 0 && targetTPS > adaptiveCapTPS {
-				targetTPS = adaptiveCapTPS
-			}
-
-			iterations := int(math.Round(targetTPS))
-			if targetTPS > 0 && iterations == 0 {
-				iterations = 1
-			}
-
-			for i := 0; i < iterations; i++ {
-				select {
-				case inflightLimiter <- struct{}{}:
-				default:
-					// Saturated: skip this slot for current cycle.
-					continue
-				}
-				go func() {
-					defer func() { <-inflightLimiter }()
-					transactionNumber := s.attemptsCount.Add(1)
-					started := time.Now()
-					var err error
-					func() {
-						defer func() {
-							if p := recover(); p != nil {
-								err = fmt.Errorf("panic: %v", p)
-							}
-						}()
-						err = r.executeScenario(s.active, transactionNumber)
-					}()
-					latency := time.Since(started).Milliseconds()
-					s.lastLatency.Store(latency)
-
-					if err != nil {
-						s.errorCount.Add(1)
+			// recover: паника в тике иначе убьёт runLoop — метрики (current_tps) перестанут обновляться.
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
 						s.mu.Lock()
-						s.status.LastError = err.Error()
+						s.status.LastError = fmt.Sprintf("runLoop tick panic: %v", p)
 						s.mu.Unlock()
-						return
 					}
-					s.successCount.Add(1)
 				}()
-			}
 
-			// Реальный TPS считаем как прирост attempts_count за фактический интервал.
-			currentAttempts := s.attemptsCount.Load()
-			prevAttempts := s.lastAttempts.Swap(currentAttempts)
-			now := time.Now()
-			elapsedSec := now.Sub(lastTPSSampleAt).Seconds()
-			lastTPSSampleAt = now
-			currentTPS := 0.0
-			if elapsedSec > 0 {
-				currentTPS = float64(currentAttempts-prevAttempts) / elapsedSec
-			}
-
-			// Adapt cap with bounded decay/recovery.
-			// Important: never drop cap to a single noisy sample instantly.
-			if currentTPS < targetTPS*0.95 {
-				decayed := adaptiveCapTPS * 0.85 // max 15% drop per cycle
-				if currentTPS > 0 && decayed < currentTPS {
-					decayed = currentTPS
+				now := time.Now()
+				var elapsedSec float64
+				if lastTPSSampleAt.IsZero() {
+					lastTPSSampleAt = now
+					elapsedSec = 1.0
+				} else {
+					elapsedSec = now.Sub(lastTPSSampleAt).Seconds()
+					lastTPSSampleAt = now
 				}
-				if decayed < 1 {
-					decayed = 1
+				if elapsedSec <= 0 {
+					elapsedSec = 1e-6
 				}
-				adaptiveCapTPS = decayed
-			} else {
-				// recover faster than before to avoid being stuck too low
-				grow := adaptiveCapTPS*1.2 + 1
-				if grow < 1 {
-					grow = 1
+
+				cfg, startedAt := s.currentConfig()
+				desiredTPS := effectiveTPS(cfg, startedAt)
+				if math.IsNaN(desiredTPS) || math.IsInf(desiredTPS, 0) {
+					desiredTPS = 0
 				}
-				adaptiveCapTPS = math.Min(desiredTPS, grow)
-			}
+				if adaptiveCapTPS <= 0 || math.IsNaN(adaptiveCapTPS) || math.IsInf(adaptiveCapTPS, 0) {
+					adaptiveCapTPS = desiredTPS
+				}
+				// Effective target is capped by what the system has recently sustained.
+				targetTPS := desiredTPS
+				if adaptiveCapTPS > 0 && targetTPS > adaptiveCapTPS {
+					targetTPS = adaptiveCapTPS
+				}
 
-			s.mu.Lock()
-			s.status.Metrics.AdaptiveTPS = adaptiveCapTPS
-			s.status.Metrics.TargetTPS = targetTPS
-			s.status.Metrics.CurrentTPS = currentTPS
-			s.mu.Unlock()
+				iterations := int(math.Round(targetTPS))
+				if targetTPS > 0 && iterations == 0 {
+					iterations = 1
+				}
 
-			if s.prom != nil {
-				s.prom.Update(
-					s.attemptsCount.Load(),
-					s.successCount.Load(),
-					s.errorCount.Load(),
-					currentTPS,
-					targetTPS,
-					s.lastLatency.Load(),
-					true,
-				)
-			}
+				for i := 0; i < iterations; i++ {
+					select {
+					case sem <- struct{}{}:
+						select {
+						case jobCh <- struct{}{}:
+						default:
+							<-sem
+						}
+					default:
+						// Saturated: skip this slot for current cycle.
+						continue
+					}
+				}
+
+				// Реальный TPS: прирост attempts_count за интервал между тиками.
+				currentAttempts := s.attemptsCount.Load()
+				prevAttempts := s.lastAttempts.Swap(currentAttempts)
+				currentTPS := float64(currentAttempts-prevAttempts) / elapsedSec
+
+				// Adapt cap with bounded decay/recovery.
+				// Important: never drop cap to a single noisy sample instantly.
+				if currentTPS < targetTPS*0.95 {
+					decayed := adaptiveCapTPS * 0.85 // max 15% drop per cycle
+					if currentTPS > 0 && decayed < currentTPS {
+						decayed = currentTPS
+					}
+					if decayed < 1 {
+						decayed = 1
+					}
+					adaptiveCapTPS = decayed
+				} else {
+					// recover faster than before to avoid being stuck too low
+					grow := adaptiveCapTPS*1.2 + 1
+					if grow < 1 {
+						grow = 1
+					}
+					adaptiveCapTPS = math.Min(desiredTPS, grow)
+				}
+
+				s.mu.Lock()
+				s.status.Metrics.AdaptiveTPS = adaptiveCapTPS
+				s.status.Metrics.TargetTPS = targetTPS
+				s.status.Metrics.CurrentTPS = currentTPS
+				s.mu.Unlock()
+
+				if s.prom != nil {
+					s.prom.Update(
+						s.attemptsCount.Load(),
+						s.successCount.Load(),
+						s.errorCount.Load(),
+						currentTPS,
+						targetTPS,
+						s.lastLatency.Load(),
+						true,
+					)
+				}
+			}()
 		}
 	}
 }
@@ -583,11 +657,8 @@ func (r *runner) executeDB(step scenario.Step, vars map[string]string) error {
 func (r *runner) bodyFromStep(step scenario.Step, vars map[string]string) (string, error) {
 	// If template name provided, render from templates/ using full var map.
 	if step.Template != "" {
-		data := make(map[string]any, len(vars))
-		for k, v := range vars {
-			data[k] = v
-		}
-		out, err := templates.Render(step.Template, data)
+		// map[string]string совместим с {{ .requestId }} в text/template; лишняя map[string]any не нужна.
+		out, err := templates.Render(step.Template, vars)
 		if err != nil {
 			return "", err
 		}
@@ -638,7 +709,8 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 		if bodyStr == "" {
 			return errors.New("mq put body is empty")
 		}
-		headers := interpolateStringMap(step.MQHeaders, vars)
+		// headers: общие из YAML (как для rest) + mq_headers; при конфликте ключей побеждает mq_headers.
+		headers := interpolateStringMap(mqHeaderSource(step), vars)
 		// Сохраняем вычисленные headers в vars текущей итерации:
 		// это позволяет шагу mq.get использовать те же значения (например RequestId)
 		// для broker-side selector.
@@ -692,9 +764,15 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 				continue
 			}
 
-			// success проверяем сразу после получения сообщения и на mismatch падаем сразу.
+			// success: если поле в payload отсутствует — вероятно «чужое» сообщение
+			// (грязная очередь, пограничные сообщения брокера) — пропускаем и читаем дальше.
+			// Если поле есть, но не совпало с ожиданием — явный ответ сервиса (например success=false).
 			if ok, reason := checkMQSuccessAssert(payload, resolvedAssert); !ok {
-				return fmt.Errorf("mq assert failed: %s", reason)
+				if mqSuccessAssertFieldPresent(payload, resolvedAssert) {
+					return fmt.Errorf("mq assert failed: %s", reason)
+				}
+				lastMismatch = reason
+				continue
 			}
 
 			ok, reason := matchesMQAssert(payload, resolvedAssert)
@@ -792,6 +870,23 @@ func checkMQSuccessAssert(payload map[string]any, assert map[string]any) (bool, 
 		return false, fmt.Sprintf("%s=%v, want %v", successFieldName, got, successExpected)
 	}
 	return true, ""
+}
+
+// mqSuccessAssertFieldPresent — в payload реально есть ключ из success_field/success в assert.
+// Нужно отличить «нет поля» (skip) от «поле есть, значение неверное» (hard fail).
+func mqSuccessAssertFieldPresent(payload map[string]any, assert map[string]any) bool {
+	if assert == nil {
+		return false
+	}
+	if _, has := assert["success"]; !has {
+		return false
+	}
+	successFieldName := "success"
+	if v, ok := assert["success_field"].(string); ok && v != "" {
+		successFieldName = v
+	}
+	_, has := payload[successFieldName]
+	return has
 }
 
 // buildMQSelectorFromAssert строит broker-selector из assert-полей.
@@ -908,12 +1003,47 @@ func (r *runner) dbFor(dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-// interpolate подставляет значения variables в шаблоны вида {{key}}.
+// interpolate подставляет значения variables в шаблоны вида {{key}} и {key}.
+// Используется strings.NewReplacer: один проход по строке; порядок замен — сначала более длинные
+// шаблоны {{key}}, затем {key}, и при нескольких ключах — более длинные имена первыми,
+// чтобы не ломать вложенные совпадения (например ключ "ab" vs "a").
 func interpolate(vars map[string]string, src string) string {
-	out := src
+	if src == "" || len(vars) == 0 {
+		return src
+	}
+	type pair struct {
+		old, new string
+	}
+	reps := make([]pair, 0, len(vars)*2)
 	for k, v := range vars {
-		out = strings.ReplaceAll(out, "{{"+k+"}}", v)
-		out = strings.ReplaceAll(out, "{"+k+"}", v)
+		reps = append(reps, pair{"{{" + k + "}}", v})
+		reps = append(reps, pair{"{" + k + "}", v})
+	}
+	sort.Slice(reps, func(i, j int) bool {
+		if len(reps[i].old) != len(reps[j].old) {
+			return len(reps[i].old) > len(reps[j].old)
+		}
+		return reps[i].old < reps[j].old
+	})
+	pairs := make([]string, 0, len(reps)*2)
+	for _, r := range reps {
+		pairs = append(pairs, r.old, r.new)
+	}
+	return strings.NewReplacer(pairs...).Replace(src)
+}
+
+// mqHeaderSource объединяет step.headers и step.mq_headers для STOMP SEND.
+// Раньше учитывались только mq_headers — новые ключи из headers: в YAML терялись.
+func mqHeaderSource(step scenario.Step) map[string]string {
+	if len(step.Headers) == 0 && len(step.MQHeaders) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(step.Headers)+len(step.MQHeaders))
+	for k, v := range step.Headers {
+		out[k] = v
+	}
+	for k, v := range step.MQHeaders {
+		out[k] = v
 	}
 	return out
 }
@@ -987,16 +1117,36 @@ func getExpectedRows(assert map[string]any) (int, bool) {
 	}
 }
 
+// refreshBaseVarsSnapshotLocked обновляет снимок переменных сценария (без requestId / TransactionNumber).
+// Должно вызываться под s.mu (write lock).
+func (s *Service) refreshBaseVarsSnapshotLocked() {
+	n := len(s.status.Config.Variables) + 2
+	if n < 2 {
+		n = 2
+	}
+	m := make(map[string]string, n)
+	for k, v := range s.status.Config.Variables {
+		m[k] = v
+	}
+	m["scenarioPath"] = s.status.ScenarioPath
+	m["scenarioName"] = s.status.ScenarioName
+	s.baseVarsSnapshot = m
+}
+
 // buildVariables формирует базовый набор переменных итерации из Config.Variables
 // и служебных полей сценария.
 func (s *Service) buildVariables() map[string]string {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	vars := make(map[string]string, len(s.status.Config.Variables)+2)
-	for k, v := range s.status.Config.Variables {
-		vars[k] = v
+	snap := s.baseVarsSnapshot
+	s.mu.RUnlock()
+	if snap == nil {
+		s.mu.Lock()
+		if s.baseVarsSnapshot == nil {
+			s.refreshBaseVarsSnapshotLocked()
+		}
+		snap = s.baseVarsSnapshot
+		s.mu.Unlock()
 	}
-	vars["scenarioPath"] = s.status.ScenarioPath
-	vars["scenarioName"] = s.status.ScenarioName
-	return vars
+	// Копия: шаги mq записывают вычисленные заголовки обратно в vars.
+	return maps.Clone(snap)
 }

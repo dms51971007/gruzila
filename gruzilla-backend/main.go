@@ -106,6 +106,11 @@ func main() {
 	}
 }
 
+// loadConfig собирает итоговую конфигурацию backend из трёх слоёв:
+// defaults -> YAML file -> environment variables.
+// Такой порядок делает поведение предсказуемым:
+// - локально можно стартовать без конфигов;
+// - в окружении можно переопределить только нужные поля через ENV.
 func loadConfig(configPath string) config {
 	absConfigPath := configPath
 	if absConfigPath == "" {
@@ -332,6 +337,9 @@ type executorsBody struct {
 	PID         int    `json:"pid"`
 }
 
+// runStart транслирует backend-запрос в CLI команду "run start".
+// Важно: backend не общается с executor напрямую, а использует CLI как
+// единый orchestration layer, чтобы не дублировать протокол/валидацию.
 func (h *handler) runStart(w http.ResponseWriter, r *http.Request) {
 	var body runBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -358,6 +366,8 @@ func (h *handler) runStart(w http.ResponseWriter, r *http.Request) {
 	h.execCLIAndWrite(w, reqID, args...)
 }
 
+// runUpdate аналогичен runStart, но отправляет частичное обновление параметров
+// уже запущенного runLoop без перезапуска процесса executor.
 func (h *handler) runUpdate(w http.ResponseWriter, r *http.Request) {
 	var body runBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -409,6 +419,9 @@ func (h *handler) runStop(w http.ResponseWriter, r *http.Request) {
 	h.execCLIAndWrite(w, reqID, "run", "stop", "--executor-url", execURL)
 }
 
+// executorsStart управляет жизненным циклом процесса executor через CLI.
+// Если лог-файл не пришёл в запросе, backend может автоматически подставить
+// путь из конфигурации (ExecutorLogsEnabled + шаблон ExecutorLogFile).
 func (h *handler) executorsStart(w http.ResponseWriter, r *http.Request) {
 	var body executorsBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -503,6 +516,9 @@ func (h *handler) executorsRestart(w http.ResponseWriter, r *http.Request) {
 	h.execCLIAndWrite(w, reqID, args...)
 }
 
+// defaultExecutorLogFile строит путь к логам executor с подстановкой {addr}.
+// Пример: logs/executor-{addr}.log + ":8081" -> logs/executor-_8081.log
+// Нормализация нужна, чтобы получить валидное имя файла на любой ОС.
 func (h *handler) defaultExecutorLogFile(addr string) string {
 	base := strings.TrimSpace(h.cfg.ExecutorLogFile)
 	if base == "" {
@@ -516,6 +532,9 @@ func (h *handler) defaultExecutorLogFile(addr string) string {
 	return strings.ReplaceAll(base, "{addr}", safeAddr)
 }
 
+// extractExecutorURL читает executor_url из тела запроса.
+// Если поле не задано, возвращается backend default executor URL.
+// Это позволяет frontend не отправлять executor_url в каждом вызове.
 func (h *handler) extractExecutorURL(r *http.Request) string {
 	var body runBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -637,6 +656,16 @@ func (h *handler) templatesCRUD(w http.ResponseWriter, r *http.Request, action s
 	h.execCLIAndWrite(w, reqID, args...)
 }
 
+// execCLIAndWrite - центральная точка интеграции backend <-> CLI.
+// Поток выполнения:
+// 1) добавляем служебные флаги (--output json, --request-id);
+// 2) запускаем CLI с timeout и рабочей директорией;
+// 3) логируем результат с корреляцией по request_id;
+// 4) если stdout не JSON, возвращаем его как plain stdout/lines.
+//
+// Такой подход удерживает backend тонким:
+// - бизнес-логика остаётся в CLI/executor;
+// - backend выступает как transport adapter для frontend.
 func (h *handler) execCLIAndWrite(w http.ResponseWriter, requestID string, commandArgs ...string) {
 	args := make([]string, 0, len(h.cfg.CLIArgs)+len(commandArgs)+4)
 	args = append(args, h.cfg.CLIArgs...)

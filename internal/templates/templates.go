@@ -30,7 +30,8 @@ func SetBaseDir(dir string) {
 
 // Render загружает шаблон по имени (с кэшированием) и применяет data.
 // Для снижения GC-нагрузки используется пул bytes.Buffer.
-func Render(name string, data map[string]any) (string, error) {
+// data обычно map[string]string из executor (допускается любой тип, поддерживаемый text/template).
+func Render(name string, data any) (string, error) {
 	t, err := getTemplate(name)
 	if err != nil {
 		return "", err

@@ -116,6 +116,7 @@ go run ./cmd/gruzilla-cli templates delete --path "new.json.tmpl" --dir "templat
 
 ## Полезные ссылки
 
+- Подробная схема проекта и потоков: `PROJECT_SCHEMA.md`
 - Сценарий Artemis request-reply: `scenarios/mq-topic1-request-reply.yml`
 - Подробная инструкция по этому сценарию: `scenarios/mq-topic1-request-reply.README.md`
 - Backend facade для UI: `gruzilla-backend/README.md`

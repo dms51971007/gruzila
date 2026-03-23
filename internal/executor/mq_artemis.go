@@ -333,16 +333,20 @@ func (m mqConnectionFactory) Put(queueName string, payload string, headers map[s
 		return fmt.Errorf("empty artemis destination")
 	}
 
-	//	log.Printf("[mq] send start destination=%s payload_size=%d", dest, len(payload))
+	// Пользовательские заголовки: stomp.SendOpt.Header делает Header.Add — дубликаты
+	// (например второй content-type) брокер может игнорировать; первый остаётся от
+	// createSendFrame (text/plain по умолчанию). Используем Set — перезапись, в т.ч. для
+	// content-type / Content-Type и кастомных полей вроде Content.
 	opts := make([]func(*frame.Frame) error, 0, len(headers))
 	for k, v := range headers {
 		key := strings.TrimSpace(k)
 		if key == "" {
 			continue
 		}
-		opts = append(opts, stomp.SendOpt.Header(key, v))
+		opts = append(opts, stompSendFrameHeaderSet(key, v))
 	}
-	if err := conn.Send(dest, "text/plain", []byte(payload), opts...); err != nil {
+	opts = append(opts, stomp.SendOpt.NoContentLength)
+	if err := conn.Send(dest, "application/json", []byte(payload), opts...); err != nil {
 		m.invalidateConn(conn)
 		log.Printf("[mq] send error destination=%s err=%v", dest, err)
 		return fmt.Errorf("artemis send to %s: %w", dest, err)
@@ -392,6 +396,20 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 			)
 			return string(msg.Body), headers, nil
 		}
+	}
+}
+
+// stompSendFrameHeaderSet задаёт один заголовок SEND через Set (не Add), чтобы
+// значения из сценария перекрывали системные (например content-type).
+func stompSendFrameHeaderSet(key, value string) func(*frame.Frame) error {
+	k := key
+	val := value
+	return func(f *frame.Frame) error {
+		if f.Command != frame.SEND {
+			return fmt.Errorf("stomp: expected SEND frame, got %s", f.Command)
+		}
+		f.Header.Set(k, val)
+		return nil
 	}
 }
 
