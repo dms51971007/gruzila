@@ -298,8 +298,11 @@ func listExecutorsUnix() ([]executorProc, error) {
 }
 
 func extractFlagValue(commandLine, flag string) string {
-	// Supports --flag value and --flag "value with spaces".
-	re := regexp.MustCompile(regexp.QuoteMeta(flag) + `\s+("([^"]+)"|(\S+))`)
+	// Supports both:
+	//   --flag value
+	//   --flag=value
+	// and quoted values with spaces.
+	re := regexp.MustCompile(regexp.QuoteMeta(flag) + `(?:\s+|=)("([^"]+)"|(\S+))`)
 	m := re.FindStringSubmatch(commandLine)
 	if len(m) == 0 {
 		return ""

@@ -116,6 +116,16 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
     const updates = await Promise.all(
       baseRows.map(async (row) => {
         const executorUrl = normalizeAddr(row.addr);
+        if (!executorUrl) {
+          return {
+            pid: row.pid,
+            status: "unreachable",
+            attemptsCount: null,
+            successCount: null,
+            errorCount: null,
+            currentTps: null,
+          };
+        }
         const response = await postApi(
           "/api/v1/run/status",
           { executor_url: executorUrl },
@@ -381,6 +391,9 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
                       selected={selectedExecutor?.pid === row.pid}
                       onClick={() => {
                         const normalized = normalizeAddr(row.addr);
+                        if (!normalized) {
+                          return;
+                        }
                         setSelectedExecutor({ ...row, url: normalized });
                         onExecutorSelected?.(normalized);
                         syncControlsFromRow(row);

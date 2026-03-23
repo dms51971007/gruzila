@@ -72,7 +72,10 @@ type Service struct {
 	errorCount    atomic.Int64
 	lastLatency   atomic.Int64
 	lastAttempts  atomic.Int64
-	prom          *PrometheusMetrics
+	// resetAdaptiveCap сигнализирует runLoop немедленно сбросить adaptive cap
+	// после внешнего Update TPS-параметров.
+	resetAdaptiveCap atomic.Bool
+	prom             *PrometheusMetrics
 	// baseVarsSnapshot — неизменяемый снимок Config.Variables + scenarioPath/scenarioName.
 	// Пересобирается в Start и Reload; buildVariables отдаёт maps.Clone для итерации (mq мутирует vars).
 	baseVarsSnapshot map[string]string
@@ -124,6 +127,7 @@ func (s *Service) Start(cfg RunConfig) error {
 	s.successCount.Store(0)
 	s.errorCount.Store(0)
 	s.lastLatency.Store(0)
+	s.resetAdaptiveCap.Store(true)
 	go s.runLoop(s.stopCh)
 	return nil
 }
@@ -160,14 +164,28 @@ func (s *Service) Update(cfg RunConfig) error {
 	if !s.running {
 		return ErrNotRunning
 	}
+	tpsChanged := false
 	if cfg.Percent > 0 {
-		s.status.Config.Percent = cfg.Percent
+		if s.status.Config.Percent != cfg.Percent {
+			s.status.Config.Percent = cfg.Percent
+			tpsChanged = true
+		}
 	}
 	if cfg.BaseTPS > 0 {
-		s.status.Config.BaseTPS = cfg.BaseTPS
+		if s.status.Config.BaseTPS != cfg.BaseTPS {
+			s.status.Config.BaseTPS = cfg.BaseTPS
+			tpsChanged = true
+		}
 	}
 	if cfg.RampUpSeconds > 0 {
-		s.status.Config.RampUpSeconds = cfg.RampUpSeconds
+		if s.status.Config.RampUpSeconds != cfg.RampUpSeconds {
+			s.status.Config.RampUpSeconds = cfg.RampUpSeconds
+			tpsChanged = true
+		}
+	}
+	if tpsChanged {
+		s.status.Metrics.AdaptiveTPS = 0
+		s.resetAdaptiveCap.Store(true)
 	}
 	// Если позже добавят обновление cfg.Variables через Update — вызвать refreshBaseVarsSnapshotLocked().
 	return nil
@@ -318,6 +336,9 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 	// Интервал для TPS — между началами обработки соседних тиков (wall clock), иначе
 	// длительная работа тика смещает окно и «ломает» скорость/адаптацию.
 	var lastTPSSampleAt time.Time
+	// carryIterations хранит дробный "остаток" iterations между тиками,
+	// чтобы корректно поддерживать targetTPS < 1 и не терять точность.
+	carryIterations := 0.0
 	adaptiveCapTPS := 0.0
 
 	for {
@@ -353,6 +374,11 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				if math.IsNaN(desiredTPS) || math.IsInf(desiredTPS, 0) {
 					desiredTPS = 0
 				}
+				if s.resetAdaptiveCap.Swap(false) {
+					adaptiveCapTPS = desiredTPS
+					// При резком изменении TPS не переносим старый дробный "хвост".
+					carryIterations = 0
+				}
 				if adaptiveCapTPS <= 0 || math.IsNaN(adaptiveCapTPS) || math.IsInf(adaptiveCapTPS, 0) {
 					adaptiveCapTPS = desiredTPS
 				}
@@ -362,10 +388,14 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 					targetTPS = adaptiveCapTPS
 				}
 
-				iterations := int(math.Round(targetTPS))
-				if targetTPS > 0 && iterations == 0 {
-					iterations = 1
+				// Планируем количество запусков по фактическому временному окну.
+				// Это исправляет искажение TPS на дробных значениях (например 0.2, 0.5, 1.7).
+				planned := targetTPS*elapsedSec + carryIterations
+				if planned < 0 {
+					planned = 0
 				}
+				iterations := int(math.Floor(planned))
+				carryIterations = planned - float64(iterations)
 
 				for i := 0; i < iterations; i++ {
 					select {
