@@ -696,11 +696,22 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 
 	// ActiveMQ Artemis via STOMP (mq_artemis.go)
 	cf := mqConnectionFactory{
-		ConnName: connName,
-		Channel:  channel,
-		QueueMgr: qm,
-		AppUser:  user,
-		AppPass:  password,
+		ConnName:              connName,
+		Channel:               channel,
+		QueueMgr:              qm,
+		AppUser:               user,
+		AppPass:               password,
+		TLSEnabled:            step.MQTLS,
+		TLSInsecure:           step.MQTLSInsecure,
+		TLSServerName:         interpolate(vars, step.MQTLSServerName),
+		TLSCAFile:             interpolate(vars, step.MQTLSCAFile),
+		TLSCertFile:           interpolate(vars, step.MQTLSCertFile),
+		TLSKeyFile:            interpolate(vars, step.MQTLSKeyFile),
+		TLSTrustStorePath:     interpolate(vars, step.MQTLSTrustStorePath),
+		TLSTrustStorePassword: interpolate(vars, step.MQTLSTrustStorePassword),
+		TLSKeyStorePath:       interpolate(vars, step.MQTLSKeyStorePath),
+		TLSKeyStorePassword:   interpolate(vars, step.MQTLSKeyStorePassword),
+		TLSCipherSuites:       interpolate(vars, step.MQTLSCipherSuites),
 	}
 
 	switch action {

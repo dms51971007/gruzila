@@ -60,6 +60,28 @@ go run ./cmd/gruzilla-cli run stop --executor-url "http://localhost:8081"
 go run ./cmd/gruzilla-cli run reset-metrics --executor-url "http://localhost:8081"
 ```
 
+## Встроенные переменные сценария
+
+В каждом прогоне executor автоматически добавляет набор встроенных переменных.
+Их можно использовать в `body`, `template`, `headers`, `mq_headers` и других строковых полях сценария.
+
+- `requestId` — уникальный id на каждую итерацию сценария
+- `TransactionNumber` — порядковый номер итерации (попытки)
+- `executorId` — стабильный id текущего процесса `gruzilla-executor`
+- `scenarioName` — имя активного сценария
+- `scenarioPath` — путь к файлу активного сценария
+
+Пример:
+
+```yaml
+mq_headers:
+  X_ServiceID: "service-{executorId}"
+  X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
+body: '{"RequestID":"{{requestId}}","scenario":"{{scenarioName}}"}'
+```
+
+Пользовательские переменные из `run start --var key=value` доступны вместе со встроенными.
+
 ## Команды `gruzilla-cli executors`
 
 Управление процессом `gruzilla-executor`:

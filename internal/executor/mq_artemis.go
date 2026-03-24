@@ -1,23 +1,38 @@
 package executor
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-stomp/stomp"
 	"github.com/go-stomp/stomp/frame"
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 // mqConnectionFactory реализует работу с ActiveMQ Artemis через STOMP.
 type mqConnectionFactory struct {
-	ConnName string
-	Channel  string
-	QueueMgr string
-	AppUser  string
-	AppPass  string
+	ConnName              string
+	Channel               string
+	QueueMgr              string
+	AppUser               string
+	AppPass               string
+	TLSEnabled            bool
+	TLSInsecure           bool
+	TLSServerName         string
+	TLSCAFile             string
+	TLSCertFile           string
+	TLSKeyFile            string
+	TLSTrustStorePath     string
+	TLSTrustStorePassword string
+	TLSKeyStorePath       string
+	TLSKeyStorePassword   string
+	TLSCipherSuites       string
 }
 
 var artemisConnCache = struct {
@@ -67,22 +82,213 @@ func (m mqConnectionFactory) connect() (*stomp.Conn, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("empty artemis address")
 	}
-	var conn *stomp.Conn
-	var err error
+
+	connOpts := make([]func(*stomp.Conn) error, 0, 1)
 	if strings.TrimSpace(m.AppUser) != "" {
-		conn, err = stomp.Dial("tcp", addr, stomp.ConnOpt.Login(m.AppUser, m.AppPass))
-	} else {
-		conn, err = stomp.Dial("tcp", addr)
+		connOpts = append(connOpts, stomp.ConnOpt.Login(m.AppUser, m.AppPass))
 	}
+
+	if m.TLSEnabled {
+		tlsCfg, err := m.tlsConfig()
+		if err != nil {
+			return nil, err
+		}
+		netConn, err := tls.Dial("tcp", addr, tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("artemis tls dial (%s): %w", addr, err)
+		}
+		conn, err := stomp.Connect(netConn, connOpts...)
+		if err != nil {
+			_ = netConn.Close()
+			return nil, fmt.Errorf("artemis stomp connect over tls (%s): %w", addr, err)
+		}
+		return conn, nil
+	}
+
+	conn, err := stomp.Dial("tcp", addr, connOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("artemis connect (%s): %w", addr, err)
 	}
 	return conn, nil
 }
 
+func (m mqConnectionFactory) tlsConfig() (*tls.Config, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: m.TLSInsecure,
+	}
+	if strings.TrimSpace(m.TLSServerName) != "" {
+		cfg.ServerName = strings.TrimSpace(m.TLSServerName)
+	}
+
+	if strings.TrimSpace(m.TLSCAFile) != "" {
+		caPEM, err := os.ReadFile(strings.TrimSpace(m.TLSCAFile))
+		if err != nil {
+			return nil, fmt.Errorf("read mq_tls_ca_file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("parse mq_tls_ca_file: no certs found")
+		}
+		cfg.RootCAs = pool
+	}
+	if cfg.RootCAs == nil && strings.TrimSpace(m.TLSTrustStorePath) != "" {
+		pool, err := loadRootCAsFromPKCS12(strings.TrimSpace(m.TLSTrustStorePath), m.TLSTrustStorePassword)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = pool
+	}
+
+	certPath := strings.TrimSpace(m.TLSCertFile)
+	keyPath := strings.TrimSpace(m.TLSKeyFile)
+	if certPath != "" || keyPath != "" {
+		if certPath == "" || keyPath == "" {
+			return nil, fmt.Errorf("both mq_tls_cert_file and mq_tls_key_file must be provided")
+		}
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load mq tls client cert/key: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	if len(cfg.Certificates) == 0 && strings.TrimSpace(m.TLSKeyStorePath) != "" {
+		cert, err := loadClientCertFromPKCS12(strings.TrimSpace(m.TLSKeyStorePath), m.TLSKeyStorePassword)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	if strings.TrimSpace(m.TLSCipherSuites) != "" {
+		ids, err := parseTLSCipherSuites(m.TLSCipherSuites)
+		if err != nil {
+			return nil, err
+		}
+		cfg.CipherSuites = ids
+		cfg.MinVersion = tls.VersionTLS12
+	}
+
+	return cfg, nil
+}
+
 // connCacheKey формирует ключ кэша соединений по endpoint/учётке.
 func (m mqConnectionFactory) connCacheKey() string {
-	return m.addr() + "|" + strings.TrimSpace(m.AppUser) + "|" + m.AppPass
+	return m.addr() + "|" +
+		strings.TrimSpace(m.AppUser) + "|" + m.AppPass + "|" +
+		fmt.Sprintf("tls=%t|insecure=%t|sni=%s|ca=%s|cert=%s|key=%s",
+			m.TLSEnabled,
+			m.TLSInsecure,
+			strings.TrimSpace(m.TLSServerName),
+			strings.TrimSpace(m.TLSCAFile),
+			strings.TrimSpace(m.TLSCertFile),
+			strings.TrimSpace(m.TLSKeyFile),
+			strings.TrimSpace(m.TLSTrustStorePath),
+			m.TLSTrustStorePassword,
+			strings.TrimSpace(m.TLSKeyStorePath),
+			m.TLSKeyStorePassword,
+			strings.TrimSpace(m.TLSCipherSuites),
+		)
+}
+
+func parseTLSCipherSuites(raw string) ([]uint16, error) {
+	parts := strings.Split(raw, ",")
+	out := make([]uint16, 0, len(parts))
+	for _, p := range parts {
+		name := strings.TrimSpace(p)
+		if name == "" {
+			continue
+		}
+		id, ok := tlsCipherSuiteByName(name)
+		if !ok {
+			return nil, fmt.Errorf("unknown mq_tls_cipher_suites value: %s", name)
+		}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("mq_tls_cipher_suites is set but empty after parsing")
+	}
+	return out, nil
+}
+
+func tlsCipherSuiteByName(name string) (uint16, bool) {
+	switch strings.TrimSpace(name) {
+	case "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256":
+		return tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, true
+	case "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384":
+		return tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, true
+	case "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256":
+		return tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true
+	case "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384":
+		return tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, true
+	default:
+		return 0, false
+	}
+}
+
+func loadRootCAsFromPKCS12(path, password string) (*x509.CertPool, error) {
+	p12, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read mq_tls_truststore_path: %w", err)
+	}
+	certs, err := pkcs12.DecodeTrustStore(p12, password)
+	if err != nil {
+		// OpenSSL-generated truststore may not mark certs as "trusted".
+		// Fallback to generic PKCS12 cert extraction.
+		blocks, err2 := pkcs12.ToPEM(p12, password)
+		if err2 != nil {
+			return nil, fmt.Errorf("parse mq_tls_truststore_path (expect PKCS12 .p12/.pfx): %w", err)
+		}
+		certs = make([]*x509.Certificate, 0, len(blocks))
+		for _, b := range blocks {
+			if b == nil || b.Type != "CERTIFICATE" {
+				continue
+			}
+			c, perr := x509.ParseCertificate(b.Bytes)
+			if perr != nil {
+				continue
+			}
+			certs = append(certs, c)
+		}
+	}
+	pool := x509.NewCertPool()
+	added := 0
+	for _, cert := range certs {
+		if cert == nil {
+			continue
+		}
+		pool.AddCert(cert)
+		added++
+	}
+	if added == 0 {
+		return nil, fmt.Errorf("mq_tls_truststore_path contains no certificates")
+	}
+	return pool, nil
+}
+
+func loadClientCertFromPKCS12(path, password string) (tls.Certificate, error) {
+	p12, err := os.ReadFile(path)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("read mq_tls_keystore_path: %w", err)
+	}
+	privateKey, leafCert, caCerts, err := pkcs12.DecodeChain(p12, password)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("parse mq_tls_keystore_path (expect PKCS12 .p12/.pfx): %w", err)
+	}
+	if privateKey == nil || leafCert == nil {
+		return tls.Certificate{}, fmt.Errorf("mq_tls_keystore_path must contain private key and certificate")
+	}
+	chain := make([][]byte, 0, 1+len(caCerts))
+	chain = append(chain, leafCert.Raw)
+	for _, c := range caCerts {
+		if c == nil {
+			continue
+		}
+		chain = append(chain, c.Raw)
+	}
+	return tls.Certificate{
+		Certificate: chain,
+		PrivateKey:  privateKey,
+		Leaf:        leafCert,
+	}, nil
 }
 
 // getOrCreateConn возвращает shared connection для операций чтения/подписок.

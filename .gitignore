@@ -1,3 +1,4 @@
 /gruzilla-frontend/node_modules/
 /.gitignore
-/logs/
+/logs/*
+/certs/*

@@ -1,0 +1,39 @@
+# Plain config: Artemis STOMP without TLS
+name: "mq-topic1-request-reply-no-ssl"
+description: "Put request to topic1, get reply, assert success=true (no SSL)"
+steps:
+  - type: mq
+    name: "put-request-to-topic1"
+    mq_action: put
+    queue: "topic_1"
+    mq_conn_name: "localhost:61614"
+    mq_channel: ""
+    mq_queue_manager: ""
+    mq_user: "artemis"
+    mq_password: "artemis"
+    mq_tls: false
+    mq_headers:
+      JMSMessageID: "{requestId}"
+      X_From: "gruzilla"
+      X_ServiceID: "service-{executorId}"
+      X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
+      X_Custom_Env: "serviceEnv"
+      RequestId: "gruzilla-{TransactionNumber}-{requestId}"
+      X_MsgId: "{requestId}"
+    body: '{"clientGuid":"550e8400-e29b-41d4-a716-446655440000","RequestID":"{{requestId}}"}'
+
+  - type: mq
+    name: "get-reply-check-success"
+    mq_action: get
+    queue: "topic_2_"
+    mq_selector: "RequestId"
+    mq_conn_name: "localhost:61614"
+    mq_channel: ""
+    mq_queue_manager: ""
+    mq_user: "artemis"
+    mq_password: "artemis"
+    mq_tls: false
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"

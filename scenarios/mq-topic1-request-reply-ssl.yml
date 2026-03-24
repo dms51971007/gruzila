@@ -1,0 +1,49 @@
+# SSL config: Artemis STOMP over TLS
+name: "mq-topic1-request-reply-ssl"
+description: "Put request to topic1, get reply, assert success=true (SSL)"
+steps:
+  - type: mq
+    name: "put-request-to-topic1"
+    mq_action: put
+    queue: "topic_1"
+    mq_conn_name: "localhost:61613"
+    mq_channel: ""
+    mq_queue_manager: ""
+    mq_user: "artemis"
+    mq_password: "artemis"
+    mq_tls: true
+    mq_tls_truststore_path: "C:/projects/load/gruzilla/certs/truststore.p12"
+    mq_tls_truststore_password: "changeit"
+    mq_tls_keystore_path: "C:/projects/load/gruzilla/certs/keystore.p12"
+    mq_tls_keystore_password: "changeit"
+    mq_tls_cipher_suites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    mq_headers:
+      JMSMessageID: "{requestId}"
+      X_From: "gruzilla"
+      X_ServiceID: "service-{executorId}"
+      X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
+      X_Custom_Env: "serviceEnv"
+      RequestId: "gruzilla-{TransactionNumber}-{requestId}"
+      X_MsgId: "{requestId}"
+    body: '{"clientGuid":"550e8400-e29b-41d4-a716-446655440000","RequestID":"{{requestId}}"}'
+
+  - type: mq
+    name: "get-reply-check-success"
+    mq_action: get
+    queue: "topic_2_"
+    mq_selector: "RequestId"
+    mq_conn_name: "localhost:61613"
+    mq_channel: ""
+    mq_queue_manager: ""
+    mq_user: "artemis"
+    mq_password: "artemis"
+    mq_tls: true
+    mq_tls_truststore_path: "C:/projects/load/gruzilla/certs/truststore.p12"
+    mq_tls_truststore_password: "changeit"
+    mq_tls_keystore_path: "C:/projects/load/gruzilla/certs/keystore.p12"
+    mq_tls_keystore_password: "changeit"
+    mq_tls_cipher_suites: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"

@@ -53,6 +53,19 @@ type Step struct {
 	MQUser     string            `yaml:"mq_user,omitempty" json:"mq_user,omitempty"`
 	MQPassword string            `yaml:"mq_password,omitempty" json:"mq_password,omitempty"`
 	MQWaitMS   int               `yaml:"mq_wait_ms,omitempty" json:"mq_wait_ms,omitempty"`
+	// MQ TLS/SSL (Artemis STOMP over TLS)
+	MQTLS           bool   `yaml:"mq_tls,omitempty" json:"mq_tls,omitempty"`
+	MQTLSInsecure   bool   `yaml:"mq_tls_insecure,omitempty" json:"mq_tls_insecure,omitempty"` // skip cert verification (dev only)
+	MQTLSServerName string `yaml:"mq_tls_server_name,omitempty" json:"mq_tls_server_name,omitempty"`
+	MQTLSCAFile     string `yaml:"mq_tls_ca_file,omitempty" json:"mq_tls_ca_file,omitempty"`
+	MQTLSCertFile   string `yaml:"mq_tls_cert_file,omitempty" json:"mq_tls_cert_file,omitempty"` // optional client cert
+	MQTLSKeyFile    string `yaml:"mq_tls_key_file,omitempty" json:"mq_tls_key_file,omitempty"`   // optional client key
+	// Java-style PKCS12/JKS-like settings compatibility (prefer PKCS12 .p12/.pfx)
+	MQTLSTrustStorePath     string `yaml:"mq_tls_truststore_path,omitempty" json:"mq_tls_truststore_path,omitempty"`
+	MQTLSTrustStorePassword string `yaml:"mq_tls_truststore_password,omitempty" json:"mq_tls_truststore_password,omitempty"`
+	MQTLSKeyStorePath       string `yaml:"mq_tls_keystore_path,omitempty" json:"mq_tls_keystore_path,omitempty"`
+	MQTLSKeyStorePassword   string `yaml:"mq_tls_keystore_password,omitempty" json:"mq_tls_keystore_password,omitempty"`
+	MQTLSCipherSuites       string `yaml:"mq_tls_cipher_suites,omitempty" json:"mq_tls_cipher_suites,omitempty"` // comma-separated Java names
 
 	// DB check
 	DBDSN   string `yaml:"db_dsn,omitempty" json:"db_dsn,omitempty"`

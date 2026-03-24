@@ -1,7 +1,0 @@
-name: Payment API example
-description: Simple REST scenario example
-steps:
-  - type: rest
-    name: Health check
-    method: GET
-    url: "http://localhost:8080/health"

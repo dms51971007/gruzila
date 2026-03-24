@@ -3,11 +3,48 @@
 Этот документ описывает команды `gruzilla-cli` для сценария:
 
 - `gruzilla/scenarios/mq-topic1-request-reply.yml`
+- `gruzilla/scenarios/mq-topic1-request-reply-ssl.yml`
+- `gruzilla/scenarios/mq-topic1-request-reply-no-ssl.yml`
 
 Сценарий делает:
 
 1. `mq put` в `topic_1`
 2. `mq get` из `topic_2_` с проверкой `success=true`
+
+---
+
+## Какой сценарий выбрать
+
+- `mq-topic1-request-reply-ssl.yml` — подключение к Artemis по TLS/SSL (`mq_tls: true`, `truststore/keystore`, `cipher suites`)
+- `mq-topic1-request-reply-no-ssl.yml` — подключение без TLS (`mq_tls: false`)
+
+Если нужен единый базовый файл, можно оставить `mq-topic1-request-reply.yml` как рабочую копию.
+
+---
+
+## Artemis через docker-compose
+
+Из корня проекта:
+
+```powershell
+docker compose -f docker-compose.artemis.yml up -d
+```
+
+Веб UI:
+
+- `http://localhost:8161/console`
+- логин/пароль: `artemis` / `artemis`
+
+Требуемые файлы сертификатов:
+
+- `certs/broker-keystore.p12`
+- `certs/truststore.p12`
+
+Остановка:
+
+```powershell
+docker compose -f docker-compose.artemis.yml down
+```
 
 ---
 
@@ -26,6 +63,27 @@ go run ./cmd/gruzilla-cli run start --executor-url "http://localhost:8081" --per
 go run ./cmd/gruzilla-cli run status --executor-url "http://localhost:8081"
 go run ./cmd/gruzilla-cli run stop --executor-url "http://localhost:8081"
 ```
+
+## Встроенные переменные сценария
+
+В каждой итерации доступны встроенные переменные (можно использовать в `body`, `headers`, `mq_headers`, `template`):
+
+- `requestId` — уникальный id итерации
+- `TransactionNumber` — номер попытки/итерации
+- `executorId` — id процесса executor (стабилен для процесса)
+- `scenarioName` — имя активного сценария
+- `scenarioPath` — путь к активному YAML
+
+Пример:
+
+```yaml
+mq_headers:
+  X_ServiceID: "service-{executorId}"
+  X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
+body: '{"RequestID":"{{requestId}}","scenario":"{{scenarioName}}"}'
+```
+
+---
 
 ---
 
@@ -189,4 +247,17 @@ go run ./cmd/gruzilla-cli run stop --executor-url "http://localhost:8081"
 go run ./cmd/gruzilla-cli run reset-metrics --executor-url "http://localhost:8081"
 go run ./cmd/gruzilla-cli run status --executor-url "http://localhost:8081"
 ```
+
+## SSL параметры в сценарии
+
+Для `mq-topic1-request-reply-ssl.yml` используются поля:
+
+- `mq_tls: true`
+- `mq_tls_truststore_path`
+- `mq_tls_truststore_password`
+- `mq_tls_keystore_path`
+- `mq_tls_keystore_password`
+- `mq_tls_cipher_suites` (например `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`)
+
+Важно: сертификат брокера должен содержать hostname из `mq_conn_name` (SAN/CN), иначе TLS-проверка имени вернёт ошибку.
 
