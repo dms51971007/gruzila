@@ -43,6 +43,7 @@ var artemisConnCache = struct {
 }
 
 const artemisPutPoolSize = 16
+const artemisHeartbeat = 30 * time.Second
 
 // artemisPutConnPool — минимальный пул коннектов только для PUT.
 // Цель: не упираться в один STOMP socket на высоком TPS.
@@ -84,6 +85,7 @@ func (m mqConnectionFactory) connect() (*stomp.Conn, error) {
 	}
 
 	connOpts := make([]func(*stomp.Conn) error, 0, 1)
+	connOpts = append(connOpts, stomp.ConnOpt.HeartBeat(artemisHeartbeat, artemisHeartbeat))
 	if strings.TrimSpace(m.AppUser) != "" {
 		connOpts = append(connOpts, stomp.ConnOpt.Login(m.AppUser, m.AppPass))
 	}
@@ -174,7 +176,7 @@ func (m mqConnectionFactory) tlsConfig() (*tls.Config, error) {
 func (m mqConnectionFactory) connCacheKey() string {
 	return m.addr() + "|" +
 		strings.TrimSpace(m.AppUser) + "|" + m.AppPass + "|" +
-		fmt.Sprintf("tls=%t|insecure=%t|sni=%s|ca=%s|cert=%s|key=%s",
+		fmt.Sprintf("tls=%t|insecure=%t|sni=%s|ca=%s|cert=%s|key=%s|truststore=%s|trustpass=%s|keystore=%s|keypass=%s|ciphers=%s",
 			m.TLSEnabled,
 			m.TLSInsecure,
 			strings.TrimSpace(m.TLSServerName),
@@ -544,7 +546,9 @@ func (m mqConnectionFactory) Put(queueName string, payload string, headers map[s
 	}
 	opts = append(opts, stomp.SendOpt.NoContentLength)
 	if err := conn.Send(dest, "application/json", []byte(payload), opts...); err != nil {
-		m.invalidateConn(conn)
+		// После потери брокера часто деградируют сразу несколько pooled-сокетов.
+		// Сбрасываем все кэши этого endpoint, чтобы следующий вызов делал чистый reconnect.
+		m.invalidateAllConns()
 		log.Printf("[mq] send error destination=%s err=%v", dest, err)
 		return fmt.Errorf("artemis send to %s: %w", dest, err)
 	}
@@ -570,6 +574,10 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 	for {
 		select {
 		case <-timeout:
+			// Если подписка "подвисла" после сетевого разрыва, timeout сам по себе
+			// не обновит cached subscription. Принудительно инвалидируем кэши,
+			// чтобы следующая попытка заново подключилась к брокеру.
+			m.invalidateAllConns()
 			return "", nil, fmt.Errorf("artemis get: no message within %v", wait)
 		case msg := <-sub.C:
 			if msg == nil {
@@ -583,10 +591,10 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 			}
 			headers := stompHeaderToMap(msg.Header)
 			log.Printf(
-				"[mq] get message destination=%s headers=%v body=%s",
+				"[mq] get message destination=%s headers=%v body_len=%d",
 				dest,
 				headers,
-				truncateForLog(string(msg.Body), 2048),
+				len(msg.Body),
 			)
 			return string(msg.Body), headers, nil
 		}
@@ -605,13 +613,6 @@ func stompSendFrameHeaderSet(key, value string) func(*frame.Frame) error {
 		f.Header.Set(k, val)
 		return nil
 	}
-}
-
-func truncateForLog(s string, limit int) string {
-	if limit <= 0 || len(s) <= limit {
-		return s
-	}
-	return s[:limit] + "...(truncated)"
 }
 
 func stompHeaderToMap(h *frame.Header) map[string]string {

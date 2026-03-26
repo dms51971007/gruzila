@@ -38,6 +38,7 @@ function parseExecutors(data) {
       successCount: null,
       errorCount: null,
       currentTps: null,
+      busyWorkers: null,
       percent: null,
       baseTps: null,
       rampUpSeconds: null,
@@ -60,6 +61,7 @@ function parseExecutors(data) {
         successCount: null,
         errorCount: null,
         currentTps: null,
+        busyWorkers: null,
         percent: null,
         baseTps: null,
         rampUpSeconds: null,
@@ -124,6 +126,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
             successCount: null,
             errorCount: null,
             currentTps: null,
+            busyWorkers: null,
           };
         }
         const response = await postApi(
@@ -141,6 +144,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
             successCount: null,
             errorCount: null,
             currentTps: null,
+            busyWorkers: null,
           };
         }
 
@@ -151,6 +155,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
         const successCount = metrics?.success_count;
         const errorCount = metrics?.error_count;
         const currentTps = metrics?.current_tps;
+        const busyWorkers = metrics?.busy_workers;
         const percent = config?.percent;
         const baseTps = config?.base_tps;
         const rampUpSeconds = config?.ramp_up_seconds;
@@ -161,6 +166,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
           successCount: Number.isFinite(Number(successCount)) ? Number(successCount) : null,
           errorCount: Number.isFinite(Number(errorCount)) ? Number(errorCount) : null,
           currentTps: Number.isFinite(Number(currentTps)) ? Number(currentTps).toFixed(2) : null,
+          busyWorkers: Number.isFinite(Number(busyWorkers)) ? Number(busyWorkers) : null,
           percent: Number.isFinite(Number(percent)) ? Number(percent) : null,
           baseTps: Number.isFinite(Number(baseTps)) ? Number(baseTps) : null,
           rampUpSeconds: Number.isFinite(Number(rampUpSeconds)) ? Number(rampUpSeconds) : null,
@@ -178,6 +184,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
         successCount: patch.successCount,
         errorCount: patch.errorCount,
         currentTps: patch.currentTps,
+        busyWorkers: patch.busyWorkers,
         percent: patch.percent,
         baseTps: patch.baseTps,
         rampUpSeconds: patch.rampUpSeconds,
@@ -380,6 +387,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
                     <TableCell>Успех</TableCell>
                     <TableCell>Ошибки</TableCell>
                     <TableCell>Current TPS</TableCell>
+                    <TableCell>Busy Workers</TableCell>
                     <TableCell align="right">Действия</TableCell>
                   </TableRow>
                 </TableHead>
@@ -410,6 +418,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
                       <TableCell>{row.successCount ?? "-"}</TableCell>
                       <TableCell>{row.errorCount ?? "-"}</TableCell>
                       <TableCell>{row.currentTps ?? "-"}</TableCell>
+                      <TableCell>{row.busyWorkers ?? "-"}</TableCell>
                       <TableCell align="right">
                         <Stack direction="row" spacing={1} justifyContent="flex-end">
                           <Button

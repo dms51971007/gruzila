@@ -8,10 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"math"
 	"net/http"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,13 +40,16 @@ type RunConfig struct {
 // Metrics — runtime-метрики текущего прогона.
 // AttemptsCount считает запущенные итерации сценария, а не только success.
 type Metrics struct {
-	AttemptsCount int64   `json:"attempts_count"` // всего запущено попыток (success + error + in-flight)
-	SuccessCount  int64   `json:"success_count"`
-	ErrorCount    int64   `json:"error_count"`
-	LastLatency   int64   `json:"last_latency_ms"`
-	AdaptiveTPS   float64 `json:"adaptive_tps"` // динамический ceiling, до которого режем target_tps
-	TargetTPS     float64 `json:"target_tps"`   // к какому TPS стремимся (effectiveTPS)
-	CurrentTPS    float64 `json:"current_tps"`  // сколько реально попыток запустили за последнюю секунду
+	AttemptsCount  int64   `json:"attempts_count"` // всего запущено попыток (success + error + in-flight)
+	SuccessCount   int64   `json:"success_count"`
+	ErrorCount     int64   `json:"error_count"`
+	LastLatency    int64   `json:"last_latency_ms"`
+	AdaptiveTPS    float64 `json:"adaptive_tps"` // динамический ceiling, до которого режем target_tps
+	TargetTPS      float64 `json:"target_tps"`   // к какому TPS стремимся (effectiveTPS)
+	CurrentTPS     float64 `json:"current_tps"`  // сколько реально попыток запустили за последнюю секунду
+	WorkerPoolSize int64   `json:"worker_pool_size"`
+	BusyWorkers    int64   `json:"busy_workers"`
+	FreeWorkers    int64   `json:"free_workers"`
 }
 
 // Status — полный снимок состояния executor для API /status.
@@ -73,6 +76,7 @@ type Service struct {
 	errorCount    atomic.Int64
 	lastLatency   atomic.Int64
 	lastAttempts  atomic.Int64
+	activeWorkers atomic.Int64
 	// resetAdaptiveCap сигнализирует runLoop немедленно сбросить adaptive cap
 	// после внешнего Update TPS-параметров.
 	resetAdaptiveCap atomic.Bool
@@ -129,6 +133,7 @@ func (s *Service) Start(cfg RunConfig) error {
 	s.successCount.Store(0)
 	s.errorCount.Store(0)
 	s.lastLatency.Store(0)
+	s.activeWorkers.Store(0)
 	s.resetAdaptiveCap.Store(true)
 	go s.runLoop(s.stopCh)
 	return nil
@@ -202,6 +207,21 @@ func (s *Service) Status() Status {
 	st.Metrics.SuccessCount = s.successCount.Load()
 	st.Metrics.ErrorCount = s.errorCount.Load()
 	st.Metrics.LastLatency = s.lastLatency.Load()
+	// Worker метрики актуализируются в runLoop, но здесь принудительно
+	// подставляем текущий busy/free для консистентности /status.
+	busy := s.activeWorkers.Load()
+	if busy < 0 {
+		busy = 0
+	}
+	if st.Metrics.WorkerPoolSize < busy {
+		st.Metrics.WorkerPoolSize = busy
+	}
+	st.Metrics.BusyWorkers = busy
+	free := st.Metrics.WorkerPoolSize - busy
+	if free < 0 {
+		free = 0
+	}
+	st.Metrics.FreeWorkers = free
 	return st
 }
 
@@ -214,6 +234,19 @@ func (s *Service) Metrics() Metrics {
 	m.SuccessCount = s.successCount.Load()
 	m.ErrorCount = s.errorCount.Load()
 	m.LastLatency = s.lastLatency.Load()
+	busy := s.activeWorkers.Load()
+	if busy < 0 {
+		busy = 0
+	}
+	if m.WorkerPoolSize < busy {
+		m.WorkerPoolSize = busy
+	}
+	m.BusyWorkers = busy
+	free := m.WorkerPoolSize - busy
+	if free < 0 {
+		free = 0
+	}
+	m.FreeWorkers = free
 	return m
 }
 
@@ -233,6 +266,9 @@ func (s *Service) ResetMetrics() error {
 	s.status.Metrics.TargetTPS = 0
 	s.status.Metrics.CurrentTPS = 0
 	s.status.Metrics.AdaptiveTPS = 0
+	s.status.Metrics.WorkerPoolSize = 0
+	s.status.Metrics.BusyWorkers = 0
+	s.status.Metrics.FreeWorkers = 0
 	return nil
 }
 
@@ -266,14 +302,7 @@ const scenarioMaxConcurrent = 4096
 
 // scenarioWorkerCount — число долгоживущих воркеров (не создаём go на каждый тик).
 func scenarioWorkerCount() int {
-	n := runtime.GOMAXPROCS(0) * 2
-	if n < 4 {
-		n = 4
-	}
-	if n > 1024 {
-		n = 1024
-	}
-	return n
+	return scenarioMaxConcurrent
 }
 
 // runScenarioIteration выполняет одну попытку сценария (счётчики, panic recover, last_error).
@@ -305,7 +334,9 @@ func (s *Service) runScenarioIteration(r *runner) {
 func (s *Service) scenarioWorker(r *runner, jobCh <-chan struct{}, sem chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for range jobCh {
+		s.activeWorkers.Add(1)
 		s.runScenarioIteration(r)
+		s.activeWorkers.Add(-1)
 		<-sem
 	}
 }
@@ -318,12 +349,15 @@ func (s *Service) scenarioWorker(r *runner, jobCh <-chan struct{}, sem chan stru
 // 4) обновляет status и Prometheus-метрики.
 func (s *Service) runLoop(stop <-chan struct{}) {
 	r := newRunner(s.buildVariables)
+	workers := scenarioWorkerCount()
+	log.Printf("runLoop started: workers=%d max_inflight=%d queue_size=%d",
+		workers, scenarioMaxConcurrent, scenarioMaxConcurrent)
 
 	// sem: слот занят с постановки в очередь до завершения воркером (как старый inflightLimiter).
 	sem := make(chan struct{}, scenarioMaxConcurrent)
 	jobCh := make(chan struct{}, scenarioMaxConcurrent)
 	var workerWG sync.WaitGroup
-	for w := 0; w < scenarioWorkerCount(); w++ {
+	for w := 0; w < workers; w++ {
 		workerWG.Add(1)
 		go s.scenarioWorker(r, jobCh, sem, &workerWG)
 	}
@@ -413,6 +447,17 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				s.status.Metrics.AdaptiveTPS = desiredTPS
 				s.status.Metrics.TargetTPS = targetTPS
 				s.status.Metrics.CurrentTPS = currentTPS
+				busy := s.activeWorkers.Load()
+				if busy < 0 {
+					busy = 0
+				}
+				s.status.Metrics.WorkerPoolSize = int64(workers)
+				s.status.Metrics.BusyWorkers = busy
+				free := int64(workers) - busy
+				if free < 0 {
+					free = 0
+				}
+				s.status.Metrics.FreeWorkers = free
 				s.mu.Unlock()
 
 				if s.prom != nil {
@@ -566,12 +611,50 @@ func (r *runner) executeREST(step scenario.Step, vars map[string]string) error {
 		return fmt.Errorf("http call: %w", err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
 
 	if expected, ok := getExpectedStatus(step.Assert); ok && resp.StatusCode != expected {
 		return fmt.Errorf("unexpected status: got %d want %d", resp.StatusCode, expected)
 	}
+	if step.RestExtractVar != "" && step.RestExtractPath != "" {
+		var payload any
+		if err := json.Unmarshal(respBody, &payload); err != nil {
+			return fmt.Errorf("parse rest response json for extract: %w", err)
+		}
+		value, err := extractJSONPathValue(payload, interpolate(vars, step.RestExtractPath))
+		if err != nil {
+			return fmt.Errorf("extract %q by path %q: %w", step.RestExtractVar, step.RestExtractPath, err)
+		}
+		vars[step.RestExtractVar] = fmt.Sprint(value)
+	}
 	return nil
+}
+
+func extractJSONPathValue(payload any, path string) (any, error) {
+	if path == "" {
+		return nil, errors.New("empty path")
+	}
+	cur := payload
+	parts := strings.Split(path, ".")
+	for _, part := range parts {
+		key := strings.TrimSpace(part)
+		if key == "" {
+			return nil, fmt.Errorf("invalid path segment in %q", path)
+		}
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("segment %q is not an object", key)
+		}
+		next, ok := obj[key]
+		if !ok {
+			return nil, fmt.Errorf("key %q not found", key)
+		}
+		cur = next
+	}
+	return cur, nil
 }
 
 // executeKafka отправляет одно сообщение в Kafka-топик шага.
@@ -660,15 +743,98 @@ func (r *runner) executeDB(step scenario.Step, vars map[string]string) error {
 func (r *runner) bodyFromStep(step scenario.Step, vars map[string]string) (string, error) {
 	// If template name provided, render from templates/ using full var map.
 	if step.Template != "" {
-		// map[string]string совместим с {{ .requestId }} в text/template; лишняя map[string]any не нужна.
-		out, err := templates.Render(step.Template, vars)
+		// Для шаблонов поддерживаем round-robin по CSV-значениям переменных:
+		// var="a,b,c" + TransactionNumber=1..N => a,b,c,a,b,c...
+		renderVars := varsForTemplateRender(vars)
+		out, err := templates.Render(step.Template, renderVars)
 		if err != nil {
 			return "", err
 		}
-		return out, nil
+		return pickTemplateVariantByTransaction(out, vars), nil
 	}
 	// Fallback to raw body with {{var}} interpolation.
 	return interpolate(vars, step.Body), nil
+}
+
+func pickTemplateVariantByTransaction(rendered string, vars map[string]string) string {
+	lines := splitTemplateVariantLines(rendered)
+	if len(lines) <= 1 {
+		return rendered
+	}
+	idx := transactionRoundRobinIndex(vars)
+	return lines[idx%len(lines)]
+}
+
+func splitTemplateVariantLines(rendered string) []string {
+	rawLines := strings.Split(rendered, "\n")
+	var variants []string
+	for _, line := range rawLines {
+		s := strings.TrimSpace(line)
+		if s == "" {
+			continue
+		}
+		s = strings.TrimSuffix(s, ",")
+		if s == "" {
+			continue
+		}
+		// Включаем режим "список шаблонов" только когда каждая строка
+		// является валидным самостоятельным JSON.
+		var probe any
+		if err := json.Unmarshal([]byte(s), &probe); err != nil {
+			return nil
+		}
+		variants = append(variants, s)
+	}
+	return variants
+}
+
+func varsForTemplateRender(vars map[string]string) map[string]string {
+	if len(vars) == 0 {
+		return vars
+	}
+	out := maps.Clone(vars)
+	idx := transactionRoundRobinIndex(vars)
+	for k, v := range out {
+		out[k] = pickCSVValueByIndex(v, idx)
+	}
+	return out
+}
+
+func transactionRoundRobinIndex(vars map[string]string) int {
+	txRaw := strings.TrimSpace(vars["TransactionNumber"])
+	if txRaw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(txRaw, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return int((n - 1) % math.MaxInt32)
+}
+
+func pickCSVValueByIndex(value string, idx int) string {
+	if !strings.Contains(value, ",") {
+		return value
+	}
+	partsRaw := strings.Split(value, ",")
+	parts := make([]string, 0, len(partsRaw))
+	for _, p := range partsRaw {
+		t := strings.TrimSpace(p)
+		if t == "" {
+			continue
+		}
+		parts = append(parts, t)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	return parts[idx%len(parts)]
 }
 
 // executeMQ выполняет mq put/get через Artemis STOMP factory.

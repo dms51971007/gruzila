@@ -34,6 +34,10 @@ type Step struct {
 	URL      string `yaml:"url,omitempty" json:"url,omitempty"`
 	Body     string `yaml:"body,omitempty" json:"body,omitempty"`
 	Template string `yaml:"template,omitempty" json:"template,omitempty"`
+	// REST extract: сохранить значение из JSON-ответа в runtime-переменную.
+	// Пример: rest_extract_var=omni_guid, rest_extract_path=values.omni_guid
+	RestExtractVar  string `yaml:"rest_extract_var,omitempty" json:"rest_extract_var,omitempty"`
+	RestExtractPath string `yaml:"rest_extract_path,omitempty" json:"rest_extract_path,omitempty"`
 	// Headers: для rest — HTTP-заголовки; для mq put дополнительно сливаются с mq_headers (см. executor).
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 

@@ -2,11 +2,20 @@
 name: "mq-topic1-request-reply-no-ssl"
 description: "Put request to topic1, get reply, assert success=true (no SSL)"
 steps:
+  - type: rest
+    name: "get-omni-guid"
+    method: GET
+    url: "http://localhost:8090/api/v1/get-next-value?pool=plh_UC23_sublist&locked=false"
+    rest_extract_var: "omni_guid"
+    rest_extract_path: "values.omni_guid"
+    assert:
+      status: 200
+
   - type: mq
     name: "put-request-to-topic1"
     mq_action: put
     queue: "topic_1"
-    mq_conn_name: "localhost:61614"
+    mq_conn_name: "localhost:61613"
     mq_channel: ""
     mq_queue_manager: ""
     mq_user: "artemis"
@@ -18,16 +27,16 @@ steps:
       X_ServiceID: "service-{executorId}"
       X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
       X_Custom_Env: "serviceEnv"
-      RequestId: "gruzilla-{TransactionNumber}-{requestId}"
+      RequestId: "{executorId}"
       X_MsgId: "{requestId}"
-    body: '{"clientGuid":"550e8400-e29b-41d4-a716-446655440000","RequestID":"{{requestId}}"}'
+    template: "mq-request-omni.json.tmpl"
 
   - type: mq
     name: "get-reply-check-success"
     mq_action: get
     queue: "topic_2_"
     mq_selector: "RequestId"
-    mq_conn_name: "localhost:61614"
+    mq_conn_name: "localhost:61613"
     mq_channel: ""
     mq_queue_manager: ""
     mq_user: "artemis"
