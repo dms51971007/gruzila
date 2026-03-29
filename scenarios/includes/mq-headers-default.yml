@@ -1,0 +1,8 @@
+mq_headers:
+  JMSMessageID: "{requestId}"
+  X_From: "gruzilla"
+  X_ServiceID: "service-{executorId}"
+  X_TransactionID: "plh1-{TransactionNumber}-{requestId}"
+  X_Custom_Env: "serviceEnv"
+  RequestId: "gruzilla-{TransactionNumber}-{requestId}"
+  X_MsgId: "{requestId}"

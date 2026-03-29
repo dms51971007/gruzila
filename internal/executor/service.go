@@ -37,19 +37,29 @@ type RunConfig struct {
 	Variables     map[string]string `json:"variables,omitempty"`
 }
 
+// StepMetric — агрегированная статистика по одному шагу сценария.
+type StepMetric struct {
+	Index         int    `json:"index"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	ErrorCount    int64  `json:"error_count"`
+	LastLatencyMs int64  `json:"last_latency_ms"`
+}
+
 // Metrics — runtime-метрики текущего прогона.
 // AttemptsCount считает запущенные итерации сценария, а не только success.
 type Metrics struct {
-	AttemptsCount  int64   `json:"attempts_count"` // всего запущено попыток (success + error + in-flight)
-	SuccessCount   int64   `json:"success_count"`
-	ErrorCount     int64   `json:"error_count"`
-	LastLatency    int64   `json:"last_latency_ms"`
-	AdaptiveTPS    float64 `json:"adaptive_tps"` // динамический ceiling, до которого режем target_tps
-	TargetTPS      float64 `json:"target_tps"`   // к какому TPS стремимся (effectiveTPS)
-	CurrentTPS     float64 `json:"current_tps"`  // сколько реально попыток запустили за последнюю секунду
-	WorkerPoolSize int64   `json:"worker_pool_size"`
-	BusyWorkers    int64   `json:"busy_workers"`
-	FreeWorkers    int64   `json:"free_workers"`
+	AttemptsCount  int64        `json:"attempts_count"` // всего запущено попыток (success + error + in-flight)
+	SuccessCount   int64        `json:"success_count"`
+	ErrorCount     int64        `json:"error_count"`
+	LastLatency    int64        `json:"last_latency_ms"`
+	AdaptiveTPS    float64      `json:"adaptive_tps"` // динамический ceiling, до которого режем target_tps
+	TargetTPS      float64      `json:"target_tps"`   // к какому TPS стремимся (effectiveTPS)
+	CurrentTPS     float64      `json:"current_tps"`  // сколько реально попыток запустили за последнюю секунду
+	WorkerPoolSize int64        `json:"worker_pool_size"`
+	BusyWorkers    int64        `json:"busy_workers"`
+	FreeWorkers    int64        `json:"free_workers"`
+	Steps          []StepMetric `json:"steps,omitempty"`
 }
 
 // Status — полный снимок состояния executor для API /status.
@@ -84,6 +94,15 @@ type Service struct {
 	// baseVarsSnapshot — неизменяемый снимок Config.Variables + scenarioPath/scenarioName.
 	// Пересобирается в Start и Reload; buildVariables отдаёт maps.Clone для итерации (mq мутирует vars).
 	baseVarsSnapshot map[string]string
+
+	// stepMu + stepAggs — счётчики по шагам active.Steps (индекс = позиция в YAML).
+	stepMu   sync.RWMutex
+	stepAggs []stepAgg
+}
+
+type stepAgg struct {
+	errors atomic.Int64
+	lastMs atomic.Int64
 }
 
 // NewService загружает сценарий с диска и инициализирует Service.
@@ -135,6 +154,9 @@ func (s *Service) Start(cfg RunConfig) error {
 	s.lastLatency.Store(0)
 	s.activeWorkers.Store(0)
 	s.resetAdaptiveCap.Store(true)
+	s.stepMu.Lock()
+	s.stepAggs = make([]stepAgg, len(s.active.Steps))
+	s.stepMu.Unlock()
 	go s.runLoop(s.stopCh)
 	return nil
 }
@@ -222,6 +244,7 @@ func (s *Service) Status() Status {
 		free = 0
 	}
 	st.Metrics.FreeWorkers = free
+	st.Metrics.Steps = s.stepMetricsSnapshot()
 	return st
 }
 
@@ -247,6 +270,7 @@ func (s *Service) Metrics() Metrics {
 		free = 0
 	}
 	m.FreeWorkers = free
+	m.Steps = s.stepMetricsSnapshot()
 	return m
 }
 
@@ -269,6 +293,9 @@ func (s *Service) ResetMetrics() error {
 	s.status.Metrics.WorkerPoolSize = 0
 	s.status.Metrics.BusyWorkers = 0
 	s.status.Metrics.FreeWorkers = 0
+	s.stepMu.Lock()
+	s.stepAggs = make([]stepAgg, len(s.active.Steps))
+	s.stepMu.Unlock()
 	return nil
 }
 
@@ -291,9 +318,56 @@ func (s *Service) Reload() error {
 	// Здесь только очищаем last_error, чтобы новые ошибки относились к новому сценарию.
 	s.status.LastError = ""
 	s.refreshBaseVarsSnapshotLocked()
+	s.stepMu.Lock()
+	s.stepAggs = make([]stepAgg, len(s.active.Steps))
+	s.stepMu.Unlock()
 	s.mu.Unlock()
 
 	return nil
+}
+
+func (s *Service) recordStepFinish(stepIndex int, step scenario.Step, durationMs int64, err error) {
+	s.stepMu.RLock()
+	n := len(s.stepAggs)
+	if stepIndex < 0 || stepIndex >= n {
+		s.stepMu.RUnlock()
+		return
+	}
+	if err != nil {
+		s.stepAggs[stepIndex].errors.Add(1)
+	}
+	s.stepAggs[stepIndex].lastMs.Store(durationMs)
+	s.stepMu.RUnlock()
+}
+
+func (s *Service) stepMetricsSnapshot() []StepMetric {
+	s.mu.RLock()
+	sc := s.active
+	s.mu.RUnlock()
+
+	s.stepMu.RLock()
+	defer s.stepMu.RUnlock()
+
+	out := make([]StepMetric, 0, len(sc.Steps))
+	for i, st := range sc.Steps {
+		name := st.Name
+		if name == "" {
+			name = st.Type
+		}
+		var ec, lm int64
+		if i < len(s.stepAggs) {
+			ec = s.stepAggs[i].errors.Load()
+			lm = s.stepAggs[i].lastMs.Load()
+		}
+		out = append(out, StepMetric{
+			Index:         i,
+			Name:          name,
+			Type:          st.Type,
+			ErrorCount:    ec,
+			LastLatencyMs: lm,
+		})
+	}
+	return out
 }
 
 // scenarioMaxConcurrent — максимум сценариев «в полёте» (очередь + выполнение),
@@ -348,7 +422,7 @@ func (s *Service) scenarioWorker(r *runner, jobCh <-chan struct{}, sem chan stru
 // 3) пересчитывает current TPS и adaptive cap;
 // 4) обновляет status и Prometheus-метрики.
 func (s *Service) runLoop(stop <-chan struct{}) {
-	r := newRunner(s.buildVariables)
+	r := newRunner(s.buildVariables, s.recordStepFinish)
 	workers := scenarioWorkerCount()
 	log.Printf("runLoop started: workers=%d max_inflight=%d queue_size=%d",
 		workers, scenarioMaxConcurrent, scenarioMaxConcurrent)
@@ -507,23 +581,25 @@ func effectiveTPS(cfg RunConfig, startedAt *time.Time) float64 {
 
 // runner исполняет одну итерацию сценария и держит локальные кэши клиентов.
 type runner struct {
-	httpClient  *http.Client
-	buildVars   func() map[string]string
-	kafkaMu     sync.Mutex
-	kafkaWriter map[string]*kafka.Writer
-	dbMu        sync.Mutex
-	dbPool      map[string]*sql.DB
+	httpClient   *http.Client
+	buildVars    func() map[string]string
+	onStepFinish func(stepIndex int, step scenario.Step, durationMs int64, err error)
+	kafkaMu      sync.Mutex
+	kafkaWriter  map[string]*kafka.Writer
+	dbMu         sync.Mutex
+	dbPool       map[string]*sql.DB
 }
 
 // newRunner создаёт runner с переиспользуемыми HTTP/Kafka/DB-клиентами.
-func newRunner(buildVars func() map[string]string) *runner {
+func newRunner(buildVars func() map[string]string, onStepFinish func(int, scenario.Step, int64, error)) *runner {
 	return &runner{
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		buildVars:   buildVars,
-		kafkaWriter: make(map[string]*kafka.Writer),
-		dbPool:      make(map[string]*sql.DB),
+		buildVars:    buildVars,
+		onStepFinish: onStepFinish,
+		kafkaWriter:  make(map[string]*kafka.Writer),
+		dbPool:       make(map[string]*sql.DB),
 	}
 }
 
@@ -535,8 +611,14 @@ func (r *runner) executeScenario(sc scenario.Scenario, transactionNumber int64) 
 	vars["requestId"] = newUUIDString()
 	vars["TransactionNumber"] = strconv.FormatInt(transactionNumber, 10)
 
-	for _, step := range sc.Steps {
-		if err := r.executeStep(step, vars); err != nil {
+	for i, step := range sc.Steps {
+		stepStarted := time.Now()
+		err := r.executeStep(step, vars)
+		ms := time.Since(stepStarted).Milliseconds()
+		if r.onStepFinish != nil {
+			r.onStepFinish(i, step, ms, err)
+		}
+		if err != nil {
 			name := step.Name
 			if name == "" {
 				name = step.Type
@@ -619,16 +701,49 @@ func (r *runner) executeREST(step scenario.Step, vars map[string]string) error {
 	if expected, ok := getExpectedStatus(step.Assert); ok && resp.StatusCode != expected {
 		return fmt.Errorf("unexpected status: got %d want %d", resp.StatusCode, expected)
 	}
-	if step.RestExtractVar != "" && step.RestExtractPath != "" {
+	if stepNeedsJSONExtract(step) {
 		var payload any
 		if err := json.Unmarshal(respBody, &payload); err != nil {
 			return fmt.Errorf("parse rest response json for extract: %w", err)
 		}
-		value, err := extractJSONPathValue(payload, interpolate(vars, step.RestExtractPath))
-		if err != nil {
-			return fmt.Errorf("extract %q by path %q: %w", step.RestExtractVar, step.RestExtractPath, err)
+		if err := applyAllJSONExtracts(step, vars, payload); err != nil {
+			return err
 		}
-		vars[step.RestExtractVar] = fmt.Sprint(value)
+	}
+	return nil
+}
+
+func stepNeedsJSONExtract(step scenario.Step) bool {
+	if len(step.Extract) > 0 {
+		return true
+	}
+	return strings.TrimSpace(step.ExtractVar) != "" && strings.TrimSpace(step.ExtractPath) != ""
+}
+
+// applyAllJSONExtracts: сначала map extract, затем пара extract_var/extract_path (можно вместе).
+func applyAllJSONExtracts(step scenario.Step, vars map[string]string, payload any) error {
+	for varName, pathTpl := range step.Extract {
+		vn := strings.TrimSpace(varName)
+		pt := strings.TrimSpace(pathTpl)
+		if vn == "" || pt == "" {
+			continue
+		}
+		path := interpolate(vars, pt)
+		value, err := extractJSONPathValue(payload, path)
+		if err != nil {
+			return fmt.Errorf("extract %q by path %q: %w", vn, pt, err)
+		}
+		vars[vn] = fmt.Sprint(value)
+	}
+	ev := strings.TrimSpace(step.ExtractVar)
+	ep := strings.TrimSpace(step.ExtractPath)
+	if ev != "" && ep != "" {
+		path := interpolate(vars, ep)
+		value, err := extractJSONPathValue(payload, path)
+		if err != nil {
+			return fmt.Errorf("extract %q by path %q: %w", ev, ep, err)
+		}
+		vars[ev] = fmt.Sprint(value)
 	}
 	return nil
 }
@@ -923,10 +1038,16 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 
 			msg, _, err := cf.Get(queue, remaining, selector)
 			if err != nil {
-				if strings.Contains(err.Error(), "no message within") {
+				errStr := err.Error()
+				if strings.Contains(errStr, "no message within") {
 					if lastMismatch != "" {
 						return fmt.Errorf("mq get: timeout waiting matching message; last mismatch: %s", lastMismatch)
 					}
+				}
+				// Get уже вызвал invalidateAllConns(); повтор в пределах общего deadline.
+				if transientArtemisGetErr(err) && remaining > 200*time.Millisecond {
+					log.Printf("[mq] get transient transport error (retry): %v", err)
+					continue
 				}
 				return err
 			}
@@ -935,6 +1056,15 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 			}
 
 			if len(resolvedAssert) == 0 {
+				if stepNeedsJSONExtract(step) {
+					var root any
+					if err := json.Unmarshal([]byte(msg), &root); err != nil {
+						return fmt.Errorf("mq get: parse json for extract: %w", err)
+					}
+					if err := applyAllJSONExtracts(step, vars, root); err != nil {
+						return err
+					}
+				}
 				return nil
 			}
 
@@ -957,6 +1087,9 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 
 			ok, reason := matchesMQAssert(payload, resolvedAssert)
 			if ok {
+				if err := applyAllJSONExtracts(step, vars, payload); err != nil {
+					return err
+				}
 				return nil
 			}
 			lastMismatch = reason
@@ -964,6 +1097,23 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 	default:
 		return fmt.Errorf("unsupported mq_action: %s", step.MQAction)
 	}
+}
+
+// transientArtemisGetErr — обрыв TCP/STOMP во время чтения; после invalidate кэша имеет смысл повторить get.
+func transientArtemisGetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "connection closed") ||
+		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "reset by peer") ||
+		strings.Contains(s, "eof") ||
+		strings.Contains(s, "nil frame") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "tcp dial")
 }
 
 // buildArtemisSelector готовит broker-side selector для SUBSCRIBE.

@@ -1,0 +1,40 @@
+{
+	"meta": {
+		"channel": "ib"
+	},
+	"data": {
+		"scenario": {
+			"id": "sc_4fb0da543509976",
+			"categoryCode": "TRANSFER",
+			"categoryName": "Переводы",
+			"kindCode": "#EMPTY#",
+			"typeCode": "#EMPTY#",
+			"code": "PT_TRANSFER_PHONE",
+			"name": "По номеру телефона",
+			"active": true,
+			"version": 4,
+			"visible": false,
+			"systemLoad": "#EMPTY#",
+			"systemInit": "#EMPTY#",
+			"systemCheck": "#EMPTY#",
+			"systemExecute": "PLH",
+			"adapterExecute": "#EMPTY#",
+			"serviceIdInit": "pmntfirscrget",
+			"serviceIdCheck": "pmntopercheck",
+			"serviceIdLoad": "#EMPTY#",
+			"serviceIdExecute": "pmntoperexec",
+			"serviceIdFinish": "pmntfnlscrget",
+			"systemFinish": "#EMPTY#",
+			"numPrefix": "УНВИ"
+		},
+		"operation": {
+			"orderId": "{{ .requestId }}"
+		},
+		"clientContext": {
+			"version": "frm_1.0",
+			"clientDateTime": "2022-03-04T12:11:32+03:00",
+			"way": "native"
+		},
+		"verifyData": {}
+	}
+}

@@ -1,0 +1,6 @@
+mq_conn_name: "localhost:61613"
+mq_channel: ""
+mq_queue_manager: ""
+mq_user: "artemis"
+mq_password: "artemis"
+mq_tls: false

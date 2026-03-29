@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -44,6 +45,11 @@ var artemisConnCache = struct {
 
 const artemisPutPoolSize = 16
 const artemisHeartbeat = 30 * time.Second
+
+// Таймауты на установку TCP/TLS/STOMP: без них net.Dial и stomp.Dial могут висеть
+// неограниченно при «чёрной дыре» в сети — воркеры остаются busy без роста метрик.
+const artemisTCPDialTimeout = 20 * time.Second
+const artemisStompHandshakeTimeout = 25 * time.Second
 
 // artemisPutConnPool — минимальный пул коннектов только для PUT.
 // Цель: не упираться в один STOMP socket на высоком TPS.
@@ -90,28 +96,54 @@ func (m mqConnectionFactory) connect() (*stomp.Conn, error) {
 		connOpts = append(connOpts, stomp.ConnOpt.Login(m.AppUser, m.AppPass))
 	}
 
+	dialer := net.Dialer{Timeout: artemisTCPDialTimeout}
+
 	if m.TLSEnabled {
 		tlsCfg, err := m.tlsConfig()
 		if err != nil {
 			return nil, err
 		}
-		netConn, err := tls.Dial("tcp", addr, tlsCfg)
+		raw, err := dialer.Dial("tcp", addr)
 		if err != nil {
-			return nil, fmt.Errorf("artemis tls dial (%s): %w", addr, err)
+			return nil, fmt.Errorf("artemis tcp dial (%s): %w", addr, err)
 		}
-		conn, err := stomp.Connect(netConn, connOpts...)
+		tlsConn := tls.Client(raw, tlsCfg)
+		if err := tlsConn.SetDeadline(time.Now().Add(artemisStompHandshakeTimeout)); err != nil {
+			_ = tlsConn.Close()
+			return nil, fmt.Errorf("artemis tls deadline (%s): %w", addr, err)
+		}
+		if err := tlsConn.Handshake(); err != nil {
+			_ = tlsConn.Close()
+			return nil, fmt.Errorf("artemis tls handshake (%s): %w", addr, err)
+		}
+		if err := tlsConn.SetDeadline(time.Now().Add(artemisStompHandshakeTimeout)); err != nil {
+			_ = tlsConn.Close()
+			return nil, err
+		}
+		stompConn, err := stomp.Connect(tlsConn, connOpts...)
+		_ = tlsConn.SetDeadline(time.Time{})
 		if err != nil {
-			_ = netConn.Close()
+			_ = tlsConn.Close()
 			return nil, fmt.Errorf("artemis stomp connect over tls (%s): %w", addr, err)
 		}
-		return conn, nil
+		return stompConn, nil
 	}
 
-	conn, err := stomp.Dial("tcp", addr, connOpts...)
+	raw, err := dialer.Dial("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("artemis connect (%s): %w", addr, err)
+		return nil, fmt.Errorf("artemis tcp dial (%s): %w", addr, err)
 	}
-	return conn, nil
+	if err := raw.SetDeadline(time.Now().Add(artemisStompHandshakeTimeout)); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("artemis stomp deadline (%s): %w", addr, err)
+	}
+	stompConn, err := stomp.Connect(raw, connOpts...)
+	_ = raw.SetDeadline(time.Time{})
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("artemis stomp connect (%s): %w", addr, err)
+	}
+	return stompConn, nil
 }
 
 func (m mqConnectionFactory) tlsConfig() (*tls.Config, error) {
@@ -312,7 +344,7 @@ func (m mqConnectionFactory) getOrCreateConn() (*stomp.Conn, error) {
 	artemisConnCache.mu.Lock()
 	if existing, ok := artemisConnCache.conns[key]; ok && existing != nil {
 		artemisConnCache.mu.Unlock()
-		_ = conn.Disconnect()
+		_ = conn.MustDisconnect()
 		return existing, nil
 	}
 	artemisConnCache.conns[key] = conn
@@ -342,7 +374,7 @@ func (m mqConnectionFactory) getOrCreatePutConn() (*stomp.Conn, error) {
 				}
 				artemisPutConnPool.mu.Unlock()
 				if extra != nil {
-					_ = extra.Disconnect()
+					_ = extra.MustDisconnect()
 				}
 			}
 		}
@@ -367,78 +399,36 @@ func (m mqConnectionFactory) getOrCreatePutConn() (*stomp.Conn, error) {
 	artemisPutConnPool.rr[key]++
 	existing := conns[idx]
 	artemisPutConnPool.mu.Unlock()
-	_ = conn.Disconnect()
+	_ = conn.MustDisconnect()
 	return existing, nil
 }
 
-// invalidateConn удаляет неисправное соединение из shared cache и PUT-пула,
-// а также очищает связанные подписки.
-// Если bad == nil, shared connection не трогается, но subscription cache
-// для этого ключа всё равно очищается.
-func (m mqConnectionFactory) invalidateConn(bad *stomp.Conn) {
-	key := m.connCacheKey()
-	artemisConnCache.mu.Lock()
-	conn, ok := artemisConnCache.conns[key]
-	disconnectShared := ok && conn != nil && (bad == nil || conn == bad)
-	if disconnectShared {
-		delete(artemisConnCache.conns, key)
+// stompTeardown закрывает STOMP-соединение без ожидания RECEIPT от брокера.
+// stomp.Disconnect() при оборванном TCP может зависнуть навсегда и заблокировать
+// все воркеры, пытающиеся сбросить кэш и переподключиться.
+func stompTeardown(c *stomp.Conn) {
+	if c != nil {
+		_ = c.MustDisconnect()
 	}
-	artemisConnCache.mu.Unlock()
-	if disconnectShared {
-		_ = conn.Disconnect()
-	}
-
-	// Remove bad conn from PUT pool (if present).
-	artemisPutConnPool.mu.Lock()
-	if conns, ok := artemisPutConnPool.pool[key]; ok && len(conns) > 0 {
-		filtered := conns[:0]
-		for _, c := range conns {
-			if c == bad {
-				_ = c.Disconnect()
-				continue
-			}
-			filtered = append(filtered, c)
-		}
-		if len(filtered) == 0 {
-			delete(artemisPutConnPool.pool, key)
-			delete(artemisPutConnPool.rr, key)
-		} else {
-			artemisPutConnPool.pool[key] = filtered
-			artemisPutConnPool.rr[key] = 0
-		}
-	}
-	artemisPutConnPool.mu.Unlock()
-
-	// При инвалидации соединения очищаем связанные подписки.
-	prefix := key + "|"
-	artemisSubCache.mu.Lock()
-	for subKey, sub := range artemisSubCache.subs {
-		if strings.HasPrefix(subKey, prefix) {
-			_ = sub.Unsubscribe()
-			delete(artemisSubCache.subs, subKey)
-		}
-	}
-	artemisSubCache.mu.Unlock()
 }
 
 // invalidateAllConns полностью сбрасывает все кэши соединений/подписок
 // для конкретного mqConnectionFactory.
 func (m mqConnectionFactory) invalidateAllConns() {
 	key := m.connCacheKey()
+	var shared *stomp.Conn
+	var pooled []*stomp.Conn
+
 	artemisConnCache.mu.Lock()
 	if conn, ok := artemisConnCache.conns[key]; ok && conn != nil {
-		_ = conn.Disconnect()
 		delete(artemisConnCache.conns, key)
+		shared = conn
 	}
 	artemisConnCache.mu.Unlock()
 
 	artemisPutConnPool.mu.Lock()
 	if conns, ok := artemisPutConnPool.pool[key]; ok {
-		for _, c := range conns {
-			if c != nil {
-				_ = c.Disconnect()
-			}
-		}
+		pooled = append([]*stomp.Conn(nil), conns...)
 		delete(artemisPutConnPool.pool, key)
 		delete(artemisPutConnPool.rr, key)
 	}
@@ -446,19 +436,40 @@ func (m mqConnectionFactory) invalidateAllConns() {
 
 	prefix := key + "|"
 	artemisSubCache.mu.Lock()
-	for subKey, sub := range artemisSubCache.subs {
+	for subKey := range artemisSubCache.subs {
 		if strings.HasPrefix(subKey, prefix) {
-			_ = sub.Unsubscribe()
 			delete(artemisSubCache.subs, subKey)
 		}
 	}
 	artemisSubCache.mu.Unlock()
+
+	stompTeardown(shared)
+	for _, c := range pooled {
+		stompTeardown(c)
+	}
 }
 
 // subCacheKey формирует ключ cache для подписки на destination+selector.
 // Это важно: для разных selector должны быть разные subscription.
 func (m mqConnectionFactory) subCacheKey(dest string, selector string) string {
 	return m.connCacheKey() + "|" + dest + "|" + strings.TrimSpace(selector)
+}
+
+// releaseCachedSub убирает подписку из кэша и отписывается на брокере.
+// Для request-reply с уникальным selector (RequestId) подписка одноразовая; если её
+// не снимать, в кэше копятся десятки subs, и при обрыве соединения go-stomp пишет
+// в log по одной строке на каждую: "Subscription … ERROR message:connection closed".
+func (m mqConnectionFactory) releaseCachedSub(dest string, selector string) {
+	key := m.subCacheKey(dest, selector)
+	artemisSubCache.mu.Lock()
+	sub, ok := artemisSubCache.subs[key]
+	if ok {
+		delete(artemisSubCache.subs, key)
+	}
+	artemisSubCache.mu.Unlock()
+	if ok && sub != nil && sub.Active() {
+		_ = sub.Unsubscribe()
+	}
 }
 
 // getOrCreateSub возвращает кэшированную подписку для destination+selector.
@@ -469,8 +480,11 @@ func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stom
 
 	artemisSubCache.mu.Lock()
 	if sub, ok := artemisSubCache.subs[key]; ok && sub != nil {
-		artemisSubCache.mu.Unlock()
-		return sub, nil
+		if sub.Active() {
+			artemisSubCache.mu.Unlock()
+			return sub, nil
+		}
+		delete(artemisSubCache.subs, key)
 	}
 	artemisSubCache.mu.Unlock()
 
@@ -486,7 +500,8 @@ func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stom
 		sub, err = conn.Subscribe(dest, stomp.AckAuto)
 	}
 	if err != nil {
-		m.invalidateConn(conn)
+		// Полный сброс: read-conn и PUT-пул, иначе после сбоя shared остаются мёртвые сокеты в пуле.
+		m.invalidateAllConns()
 		if selector != "" {
 			return nil, fmt.Errorf("artemis subscribe %s with selector %q: %w", dest, selector, err)
 		}
@@ -495,9 +510,12 @@ func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stom
 
 	artemisSubCache.mu.Lock()
 	if existing, ok := artemisSubCache.subs[key]; ok && existing != nil {
-		artemisSubCache.mu.Unlock()
-		_ = sub.Unsubscribe()
-		return existing, nil
+		if existing.Active() {
+			artemisSubCache.mu.Unlock()
+			_ = sub.Unsubscribe()
+			return existing, nil
+		}
+		delete(artemisSubCache.subs, key)
 	}
 	artemisSubCache.subs[key] = sub
 	artemisSubCache.mu.Unlock()
@@ -596,6 +614,7 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 				headers,
 				len(msg.Body),
 			)
+			m.releaseCachedSub(dest, selector)
 			return string(msg.Body), headers, nil
 		}
 	}

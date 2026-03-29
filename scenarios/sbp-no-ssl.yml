@@ -1,0 +1,102 @@
+# SBP: цепочка MQ request-reply через Artemis STOMP без TLS
+name: "sbp-no-ssl"
+description: "SBP flow: несколько IN/OUT очередей"
+steps:
+
+  - type: mq
+    name: "put-request-step1"
+    mq_action: put
+    queue: "IN.RQ.TRNFFIRSCRGET_02.00.00"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_headers_profile: "includes/mq-headers-executorid.yml"
+    template: "SBP_step1.json.tmpl"
+
+  - type: mq
+    name: "get-reply-step1"
+    mq_action: get
+    queue: "OUT.RS.TRNFFIRSCRGET_02.00.00"
+    mq_selector: "RequestId"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"
+
+  - type: mq
+    name: "put-request-step2"
+    mq_action: put
+    queue: "IN.RQ.TRNFOPERCHECK_01.00.00"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_headers_profile: "includes/mq-headers-executorid.yml"
+    template: "SBP_step2.json.tmpl"
+
+  # payId — из тела ответа второй MQ-операции (get после put OPERCHECK); используется в шаблонах шагов 3–4
+  - type: mq
+    name: "get-reply-step2"
+    mq_action: get
+    queue: "OUT.RS.TRNFOPERCHECK_01.00.00"
+    mq_selector: "RequestId"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_wait_ms: 15000
+    extract:
+      payId: "payment.orderId"
+    assert:
+      success_field: "status"
+      success: "success"
+
+  - type: mq
+    name: "put-request-step3"
+    mq_action: put
+    queue: "IN.RQ.TRNFFNLSCRGET_01.00.00"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_headers_profile: "includes/mq-headers-executorid.yml"
+    template: "SBP_step3.json.tmpl"
+
+  - type: mq
+    name: "get-reply-step3"
+    mq_action: get
+    queue: "OUT.RS.TRNFFNLSCRGET_01.00.00"
+    mq_selector: "RequestId"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"
+
+  - type: mq
+    name: "put-request-step4"
+    mq_action: put
+    queue: "IN.RQ.TRNFOPEREXEC_01.00.00"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_headers_profile: "includes/mq-headers-executorid.yml"
+    template: "SBP_step4.json.tmpl"
+
+  - type: mq
+    name: "get-reply-step4"
+    mq_action: get
+    queue: "OUT.RS.TRNFOPEREXEC_01.00.00"
+    mq_selector: "RequestId"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"
+
+  - type: mq
+    name: "put-request-step5"
+    mq_action: put
+    queue: "IN.RQ.SFPTRNFSTATGET_01.00.00"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_headers_profile: "includes/mq-headers-executorid.yml"
+    template: "step5_SBP.json.tmpl"
+
+  - type: mq
+    name: "get-reply-step5"
+    mq_action: get
+    queue: "OUT.RS.SFPTRNFSTATGET_01.00.00"
+    mq_selector: "RequestId"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"

@@ -1,0 +1,177 @@
+{
+	"meta": {
+		"systemId": "OMNI",
+		"channel": "ib"
+	},
+	"data": {
+		"guid": "${omni_guid}",
+		"scenario": {
+			"id": "sc_4fb0da543509976",
+			"categoryCode": "TRANSFER",
+			"categoryName": "Переводы",
+			"kindCode": "#EMPTY#",
+			"typeCode": "#EMPTY#",
+			"code": "PT_TRANSFER_PHONE",
+			"name": "По номеру телефона",
+			"active": true,
+			"version": 4,
+			"visible": false,
+			"systemLoad": "#EMPTY#",
+			"systemInit": "#EMPTY#",
+			"systemCheck": "#EMPTY#",
+			"systemExecute": "PLH",
+			"adapterExecute": "#EMPTY#",
+			"serviceIdInit": "pmntfirscrget",
+			"serviceIdCheck": "pmntopercheck",
+			"serviceIdLoad": "#EMPTY#",
+			"serviceIdExecute": "pmntoperexec",
+			"serviceIdFinish": "pmntfnlscrget",
+			"systemFinish": "#EMPTY#",
+			"numPrefix": "УНВИ"
+		},
+		"operation": {
+			"orderId": "{{ .requestId }}",
+			"order4client": "УНВИ-63/22-61409ГУ7БПУ",
+			"acceptedTime": 1646385136088,
+			"values": [
+				{
+					"id": "payment.recipient.default.bank.name"
+				},
+				{
+					"id": "payment.sbp.transaction.id",
+					"value": "{{ .requestId }}"
+				},
+				{
+					"id": "payment.control.value",
+					"value": "0070005300001 0070000000000 100000000001C2CPush {{ .requestId }}49HUvGOFgff2prPL37bdN85ceC1NFi7dU1+BEo/8whM=;;"
+				},
+				{
+					"id": "payment.payer.phone",
+					"value": "70000000000"
+				},
+				{
+					"id": "payment.recipient.phone",
+					"value": "70005300001",
+					"displayValue": "+ 7 000 530 00 01"
+				},
+				{
+					"id": "payment.recipient.guid",
+					"value": "1BC8BD9E87C6427795F1FB90FFBDFBE2"
+				},
+				{
+					"id": "payment.recipient.name",
+					"value": "Семь Тестовый К."
+				},
+				{
+					"id": "payment.print.execute.datetime",
+					"value": "1646385175107"
+				},
+				{
+					"id": "payment.amount",
+					"value": "123",
+					"displayValue": "123 ₽"
+				},
+				{
+					"id": "payment.recipient.message",
+					"value": "Тест",
+					"displayValue": "Тест"
+				},
+				{
+					"id": "payment.payerProduct.extId",
+					"value": "94528d73-a4a8-40de-9b80-39d5fd652ae0",
+					"displayValue": "*2615 Зарплатная карта",
+					"extendedValue": "{ \"productInfo\" : { \"code\" : \"Зарп Visa Gold Кэшбэк Газпром\", \"type\" : \"card\", \"cardNumber\" : \"4249170006682615\", \"virtualNum\" : \"DRTL10114888287\", \"accNumber\" : \"40817810900602571428\", \"accOwnerFullName\" : \"КЛИЕНТ ПЯТЬ ТЕСТОВЫЙ\", \"accOwnerId\" : \"40000000076\", \"systemInfo\" : { \"systemId\" : \"DRTL\", \"rawId\" : \"40000000076\" }, \"bank\" : { \"bic\" : \"044525823\", \"fullName\" : \" Газпромбанк (Акционерное общество)\", \"corrAcc\" : \"30101810200000000823\", \"shortName\" : \"Банк ГПБ (АО)\", \"inn\" : \"7744001497\", \"kpp\" : \"997950001\", \"departments\" : [ { \"code\" : \"015/1042\" } ] }, \"currency\" : { \"numCode\" : \"810\", \"charCode\" : \"RUB\" }, \"balance\" : [ { \"type\" : \"mainAmount\", \"value\" : { \"amount\" : \"8360639.29\", \"currency\" : { \"numCode\" : \"643\", \"charCode\" : \"RUB\" } } }, { \"type\" : \"ownFunds\", \"value\" : { \"amount\" : \"8360639.29\", \"currency\" : { \"numCode\" : \"643\", \"charCode\" : \"RUB\" } } }, { \"type\" : \"creditAmount\", \"value\" : { \"amount\" : \"0.00\", \"currency\" : { \"numCode\" : \"643\", \"charCode\" : \"RUB\" } } }, { \"type\" : \"holdAmount\", \"value\" : { \"amount\" : \"123.00\", \"currency\" : { \"numCode\" : \"643\", \"charCode\" : \"RUB\" } } } ], \"productImageUrl\" : \"\", \"icon\" : \"gold-visa\", \"design\" : \"gold_visa\", \"originalStateName\" : \"VALID CARD\", \"paySystemCode\" : \"VISA\", \"subtype\" : \"salary\" }}"
+				},
+				{
+					"id": "payment.currency",
+					"value": "RUB",
+					"displayValue": " ₽"
+				},
+				{
+					"id": "payment.recipient.bank.name",
+					"value": "1crt88888881",
+					"displayValue": "ПИР Банк"
+				},
+				{
+					"id": "payment.payerProduct.balance",
+					"value": "8360639.29",
+					"displayValue": "8360639.29"
+				},
+				{
+					"id": "payment.orderId",
+					"value": "{{ .payId }}"
+				},
+				{
+					"id": "payment.omni.orderId",
+					"value": "{{ .requestId }}",
+					"displayValue": "",
+					"extendedValue": ""
+				},
+				{
+					"id": "payment.print.currency",
+					"value": "643",
+					"displayValue": "",
+					"extendedValue": ""
+				},
+				{
+					"id": "payment.commission",
+					"value": "0",
+					"displayValue": "0 ₽"
+				},
+				{
+					"id": "payment.total",
+					"value": "123",
+					"displayValue": "123 ₽"
+				},
+				{
+					"id": "payment.recipient.maskName",
+					"value": "Петр Петрович П",
+					"displayValue": "Петр Петрович П"
+				},
+				{
+					"id": "willName",
+					"value": "По номеру телефона",
+					"displayValue": "По номеру телефона"
+				},
+				{
+					"id": "willDescription",
+					"value": "Перевод с 424917*2615 по номеру телефона 70005300001 в банк 1crt88888881. Сумма 123 RUB",
+					"displayValue": "Перевод с 424917*2615 по номеру телефона 70005300001 в банк 1crt88888881. Сумма 123 RUB"
+				},
+				{
+					"id": "payment.smft.payer.number",
+					"value": "4249170006682615"
+				},
+				{
+					"id": "payment.smft.payer.fio",
+					"value": "КЛИЕНТ ПЯТЬ ТЕСТОВЫЙ"
+				},
+				{
+					"id": "payment.smft.payer.bank.bic",
+					"value": "044525823"
+				},
+				{
+					"id": "payment.smft.commission",
+					"value": "0"
+				},
+				{
+					"id": "payment.smft.payer.card.number",
+					"value": "4249170006682615"
+				},
+				{
+					"id": "payment.smft.purpose",
+					"value": "Тест"
+				},
+				{
+					"id": "payment.smft.payee.number",
+					"value": "70005300001"
+				}
+			]
+		},
+		"clientContext": {
+			"version": "frm_1.0",
+			"clientDateTime": "2022-03-04T12:12:54+03:00",
+			"params": []
+		}
+	}
+}

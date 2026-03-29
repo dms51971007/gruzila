@@ -1,0 +1,6 @@
+method: GET
+url: "http://localhost:8090/api/v1/get-next-value?pool=plh_UC23_sublist&locked=false"
+extract:
+  omni_guid: "values.omni_guid"
+assert:
+  status: 200
