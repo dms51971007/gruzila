@@ -1,16 +1,27 @@
-import { Card, CardContent, Stack, TextField, Typography } from "@mui/material";
+import { Card, CardContent, FormControlLabel, Stack, Switch, TextField, Typography } from "@mui/material";
 
 export default function BackendConnectionPanel({
   backendUrl,
   onBackendUrlChange,
   statsRefreshSeconds,
   onStatsRefreshSecondsChange,
+  showApiResponse,
+  onShowApiResponseChange,
 }) {
   return (
     <Card>
       <CardContent>
         <Stack spacing={2}>
-          <Typography variant="h6">Backend Connection</Typography>
+          <Typography variant="h6">Настройки</Typography>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(showApiResponse)}
+                onChange={(e) => onShowApiResponseChange?.(e.target.checked)}
+              />
+            }
+            label="Показывать ответы API (Response) на вкладках"
+          />
           <TextField
             label="Backend Base URL"
             value={backendUrl}

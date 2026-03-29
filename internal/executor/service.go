@@ -274,19 +274,21 @@ func (s *Service) Metrics() Metrics {
 	return m
 }
 
-// ResetMetrics обнуляет счётчики и last_error. Разрешено только когда нагрузка остановлена (running == false).
+// ResetMetrics обнуляет счётчики, last_error и агрегаты по шагам.
+// Допустимо и при running: окно измерения «с нуля», ramp-up по StartedAt не трогаем.
 func (s *Service) ResetMetrics() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running {
-		return errors.New("cannot reset metrics while load is running; stop first")
-	}
+	running := s.running
 	s.attemptsCount.Store(0)
 	s.successCount.Store(0)
 	s.errorCount.Store(0)
 	s.lastLatency.Store(0)
+	s.lastAttempts.Store(0)
 	s.status.LastError = ""
-	s.status.StartedAt = nil
+	if !running {
+		s.status.StartedAt = nil
+	}
 	s.status.Metrics.TargetTPS = 0
 	s.status.Metrics.CurrentTPS = 0
 	s.status.Metrics.AdaptiveTPS = 0

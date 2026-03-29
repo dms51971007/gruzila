@@ -14,47 +14,73 @@ import ExecutorsPanel from "./components/ExecutorsPanel";
 import ScenariosPanel from "./components/ScenariosPanel";
 import TemplatesPanel from "./components/TemplatesPanel";
 
-function TabPanel({ value, index, children }) {
+function TabPanel({ value, index, children, fullHeight }) {
   if (value !== index) return null;
-  return <Box sx={{ mt: 2 }}>{children}</Box>;
+  return (
+    <Box
+      sx={{
+        mt: 2,
+        ...(fullHeight
+          ? {
+              flex: 1,
+              minHeight: 0,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }
+          : {}),
+      }}
+    >
+      {children}
+    </Box>
+  );
 }
 
 export default function App() {
-  const [page, setPage] = useState("backend");
+  const [page, setPage] = useState("executors");
   const [backendUrl, setBackendUrl] = useState("http://localhost:8080");
   const [statsRefreshSeconds, setStatsRefreshSeconds] = useState(5);
+  const [showApiResponse, setShowApiResponse] = useState(false);
 
   const pages = useMemo(
     () => [
       {
+        key: "executors",
+        label: "Executors",
+        content: (
+          <ExecutorsPanel
+            baseUrl={backendUrl}
+            statsRefreshSeconds={statsRefreshSeconds}
+            showApiResponse={showApiResponse}
+          />
+        ),
+      },
+      {
+        key: "scenarios",
+        label: "Сценарии",
+        content: <ScenariosPanel baseUrl={backendUrl} showApiResponse={showApiResponse} />,
+      },
+      {
+        key: "templates",
+        label: "Шаблоны",
+        content: <TemplatesPanel baseUrl={backendUrl} showApiResponse={showApiResponse} />,
+      },
+      {
         key: "backend",
-        label: "Подключение",
+        label: "Настройки",
         content: (
           <BackendConnectionPanel
             backendUrl={backendUrl}
             onBackendUrlChange={setBackendUrl}
             statsRefreshSeconds={statsRefreshSeconds}
             onStatsRefreshSecondsChange={setStatsRefreshSeconds}
+            showApiResponse={showApiResponse}
+            onShowApiResponseChange={setShowApiResponse}
           />
         ),
       },
-      {
-        key: "executors",
-        label: "Executors",
-        content: <ExecutorsPanel baseUrl={backendUrl} statsRefreshSeconds={statsRefreshSeconds} />,
-      },
-      {
-        key: "scenarios",
-        label: "Сценарии (редактирование)",
-        content: <ScenariosPanel baseUrl={backendUrl} />,
-      },
-      {
-        key: "templates",
-        label: "Шаблоны",
-        content: <TemplatesPanel baseUrl={backendUrl} />,
-      },
     ],
-    [backendUrl],
+    [backendUrl, statsRefreshSeconds, showApiResponse],
   );
 
   const activeIndex = Math.max(
@@ -63,16 +89,27 @@ export default function App() {
   );
 
   return (
-    <Box sx={{ minHeight: "100vh", display: "flex" }}>
+    <Box sx={{ height: "100vh", minHeight: "100vh", display: "flex", flexDirection: "row", overflow: "hidden" }}>
       <Container
         maxWidth={false}
         disableGutters
-        sx={{ py: 3, pl: { md: "320px" }, pr: 2 }}
+        sx={{
+          flex: 1,
+          minWidth: 0,
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          py: 3,
+          pl: { md: "320px" },
+          pr: 2,
+        }}
       >
-        <Stack spacing={2}>
-          <Typography variant="h4">Gruzilla Frontend</Typography>
+        <Stack spacing={2} sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+          <Typography variant="h4" sx={{ flexShrink: 0 }}>
+            Gruzilla Frontend
+          </Typography>
           {pages.map((p, i) => (
-            <TabPanel key={p.key} value={activeIndex} index={i}>
+            <TabPanel key={p.key} value={activeIndex} index={i} fullHeight={p.key === "scenarios" || p.key === "templates"}>
               {p.content}
             </TabPanel>
           ))}

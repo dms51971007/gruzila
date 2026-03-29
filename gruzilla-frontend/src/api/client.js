@@ -46,3 +46,33 @@ export function extractCliData(payload) {
   }
   return outer;
 }
+
+/**
+ * Текст файла из ответа templates/read или scenarios/read.
+ * Обычно приходит в `data.stdout`. Если содержимое файла — валидный JSON, backend
+ * парсит весь stdout как JSON и кладёт объект в `data` без поля `stdout` — тогда
+ * собираем строку обратно для редактора.
+ */
+/** Сортировка путей по имени файла (без каталога), без учёта регистра. */
+export function sortPathsByFileName(paths) {
+  if (!Array.isArray(paths)) return [];
+  const base = (p) => {
+    const s = String(p || "").replace(/\\/g, "/");
+    const i = s.lastIndexOf("/");
+    return i >= 0 ? s.slice(i + 1) : s;
+  };
+  return [...paths].sort((a, b) => base(a).localeCompare(base(b), undefined, { sensitivity: "base" }));
+}
+
+export function extractReadFileStdout(data) {
+  if (data == null) return undefined;
+  if (typeof data === "string") return data;
+  if (typeof data === "number" || typeof data === "boolean") return String(data);
+  if (typeof data !== "object") return undefined;
+  if (typeof data.stdout === "string") return data.stdout;
+  try {
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return undefined;
+  }
+}

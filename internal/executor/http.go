@@ -109,7 +109,7 @@ func (h *Handler) reload(w http.ResponseWriter, _ *http.Request) {
 	api.WriteSuccess(w, h.svc.Status())
 }
 
-// resetMetrics очищает counters и last_error (доступно только в stopped state).
+// resetMetrics очищает counters и last_error (в т.ч. при активной нагрузке).
 func (h *Handler) resetMetrics(w http.ResponseWriter, _ *http.Request) {
 	if err := h.svc.ResetMetrics(); err != nil {
 		api.WriteError(w, err.Error())

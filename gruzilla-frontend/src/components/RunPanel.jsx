@@ -36,7 +36,7 @@ function urlFromAddr(addr) {
   return `http://localhost:${v}`;
 }
 
-export default function RunPanel({ baseUrl, selectedExecutorUrl }) {
+export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse = false }) {
   const [executorUrl, setExecutorUrl] = useState("http://localhost:8081");
   const [executorAddr, setExecutorAddr] = useState(":8081");
   const [executorBin, setExecutorBin] = useState("go");
@@ -276,7 +276,7 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl }) {
         </CardContent>
       </Card>
 
-      <ResponseCard title="Run API Response" response={lastResponse} />
+      {showApiResponse ? <ResponseCard title="Run API Response" response={lastResponse} /> : null}
     </Stack>
   );
 }

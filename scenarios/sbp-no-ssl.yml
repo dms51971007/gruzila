@@ -88,7 +88,7 @@ steps:
     queue: "IN.RQ.SFPTRNFSTATGET_01.00.00"
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_headers_profile: "includes/mq-headers-executorid.yml"
-    template: "step5_SBP.json.tmpl"
+    template: "SBP_step5.json.tmpl"
 
   - type: mq
     name: "get-reply-step5"

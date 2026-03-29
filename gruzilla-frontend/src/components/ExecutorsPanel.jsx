@@ -9,7 +9,6 @@ import {
   Card,
   CardContent,
   Chip,
-  Grid,
   IconButton,
   MenuItem,
   Stack,
@@ -33,6 +32,15 @@ function normalizeAddr(addr) {
   if (v.startsWith(":")) return `http://localhost${v}`;
   if (v.startsWith("http://") || v.startsWith("https://")) return v;
   return `http://localhost:${v}`;
+}
+
+/** Адрес listen для executor (`--addr`): только порт в UI → `:8081`. */
+function normalizeExecutorListenAddr(raw) {
+  const v = String(raw || "").trim();
+  if (!v) return "";
+  if (v.startsWith(":")) return v;
+  if (/^\d+$/.test(v)) return `:${v}`;
+  return v;
 }
 
 function parseExecutors(data) {
@@ -93,12 +101,15 @@ function statusColor(status) {
   }
 }
 
-export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefreshSeconds = 5 }) {
+export default function ExecutorsPanel({
+  baseUrl,
+  onExecutorSelected,
+  statsRefreshSeconds = 5,
+  showApiResponse = false,
+}) {
   const [scenario, setScenario] = useState("");
-  const [scenarioDir, setScenarioDir] = useState("scenarios");
   const [scenarios, setScenarios] = useState([]);
-  const [addr, setAddr] = useState(":8081");
-  const [bin, setBin] = useState("go");
+  const [addr, setAddr] = useState("8081");
   const [rows, setRows] = useState([]);
   const [selectedExecutor, setSelectedExecutor] = useState(null);
   const [percent, setPercent] = useState(100);
@@ -264,7 +275,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
   };
 
   const loadScenarios = async () => {
-    const response = await postApi("/api/v1/scenarios/list", { dir: scenarioDir }, { baseUrl });
+    const response = await postApi("/api/v1/scenarios/list", { dir: "scenarios" }, { baseUrl });
     const data = extractCliData(response.payload);
     const lines = Array.isArray(data?.lines) ? data.lines : [];
     setScenarios(lines);
@@ -276,15 +287,16 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
   const startExecutor = async () => {
     setLoading(true);
     try {
+      const listenAddr = normalizeExecutorListenAddr(addr);
       const response = await postApi(
         "/api/v1/executors/start",
-        { scenario, addr, bin },
+        { scenario, addr: listenAddr, bin: "go" },
         { baseUrl },
       );
       setLastResponse(response);
       await refresh();
-      const normalized = normalizeAddr(addr);
-      const selected = { addr, url: normalized, scenario };
+      const normalized = normalizeAddr(listenAddr);
+      const selected = { addr: listenAddr, url: normalized, scenario };
       setSelectedExecutor(selected);
       onExecutorSelected?.(normalized);
       syncControlsFromRow(selected);
@@ -405,23 +417,33 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
               </Button>
             </Stack>
 
-            <Grid container spacing={2}>
-              <Grid size={{ xs: 12, md: 3 }}>
-                <TextField
-                  label="Scenario Directory"
-                  value={scenarioDir}
-                  onChange={(e) => setScenarioDir(e.target.value)}
-                  fullWidth
-                />
-              </Grid>
-              <Grid size={{ xs: 12, md: 5 }}>
+            <Stack spacing={0.5}>
+              <Stack
+                direction={{ xs: "column", sm: "row" }}
+                spacing={2}
+                alignItems={{ xs: "stretch", sm: "center" }}
+                useFlexGap
+              >
+                <Button
+                  variant="contained"
+                  disabled={loading || !String(scenario || "").trim()}
+                  onClick={startExecutor}
+                  sx={{
+                    minWidth: { sm: 160 },
+                    height: 40,
+                    flexShrink: 0,
+                  }}
+                >
+                  Запустить
+                </Button>
                 {scenarios.length > 0 ? (
                   <TextField
                     select
-                    label="Config (scenario)"
+                    label="Сценарий"
                     value={scenario}
                     onChange={(e) => setScenario(e.target.value)}
-                    fullWidth
+                    size="small"
+                    sx={{ width: { xs: "100%", sm: 280 }, maxWidth: "100%", flexShrink: 0 }}
                   >
                     {scenarios.map((item) => (
                       <MenuItem key={item} value={item}>
@@ -431,39 +453,29 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
                   </TextField>
                 ) : (
                   <TextField
-                    label="Config (scenario path)"
+                    label="Сценарий"
                     value={scenario}
                     onChange={(e) => setScenario(e.target.value)}
-                    fullWidth
-                    helperText="Список пуст. Можно ввести путь вручную."
+                    size="small"
+                    sx={{ width: { xs: "100%", sm: 280 }, maxWidth: "100%", flexShrink: 0 }}
+                    placeholder="sbp-no-ssl.yml"
                   />
                 )}
-              </Grid>
-              <Grid size={{ xs: 6, md: 2 }}>
                 <TextField
-                  label="Port / Addr"
+                  label="Порт"
                   value={addr}
                   onChange={(e) => setAddr(e.target.value)}
-                  fullWidth
-                  helperText="Напр. :8082"
+                  size="small"
+                  sx={{ width: { xs: "100%", sm: 140 }, flexShrink: 0 }}
+                  placeholder="8081"
                 />
-              </Grid>
-              <Grid size={{ xs: 6, md: 2 }}>
-                <TextField
-                  label="Bin"
-                  value={bin}
-                  onChange={(e) => setBin(e.target.value)}
-                  fullWidth
-                />
-              </Grid>
-              <Grid size={{ xs: 12, md: 2 }}>
-                <Stack spacing={1}>
-                  <Button variant="contained" fullWidth disabled={loading || !scenario} onClick={startExecutor}>
-                    Создать executor
-                  </Button>
-                </Stack>
-              </Grid>
-            </Grid>
+              </Stack>
+              {scenarios.length === 0 && (
+                <Typography variant="caption" color="text.secondary">
+                  Список сценариев пуст — введите имя файла (например sbp-no-ssl.yml). Каталог: scenarios.
+                </Typography>
+              )}
+            </Stack>
 
             <TableContainer sx={{ width: "100%", overflowX: "auto" }}>
               <Table size="small" sx={{ minWidth: 1320 }}>
@@ -693,7 +705,7 @@ export default function ExecutorsPanel({ baseUrl, onExecutorSelected, statsRefre
         </CardContent>
       </Card>
 
-      <ResponseCard title="Executors API Response" response={lastResponse} />
+      {showApiResponse ? <ResponseCard title="Executors API Response" response={lastResponse} /> : null}
     </Stack>
   );
 }
