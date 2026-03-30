@@ -39,7 +39,7 @@ steps:
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_wait_ms: 15000
     extract:
-      payId: "payment.orderId"
+      payId: "data.operation.values.[id=payment.orderId].value"
     assert:
       success_field: "status"
       success: "success"

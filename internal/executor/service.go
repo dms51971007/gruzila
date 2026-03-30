@@ -750,16 +750,98 @@ func applyAllJSONExtracts(step scenario.Step, vars map[string]string, payload an
 	return nil
 }
 
+// splitExtractPath делит путь по точкам, не разрывая сегменты [...] (в значении может быть точка).
+func splitExtractPath(path string) []string {
+	var parts []string
+	var b strings.Builder
+	bracketDepth := 0
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		switch c {
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '.':
+			if bracketDepth == 0 {
+				if s := strings.TrimSpace(b.String()); s != "" {
+					parts = append(parts, s)
+				}
+				b.Reset()
+				continue
+			}
+		}
+		b.WriteByte(c)
+	}
+	if s := strings.TrimSpace(b.String()); s != "" {
+		parts = append(parts, s)
+	}
+	return parts
+}
+
 func extractJSONPathValue(payload any, path string) (any, error) {
 	if path == "" {
 		return nil, errors.New("empty path")
 	}
 	cur := payload
-	parts := strings.Split(path, ".")
+	parts := splitExtractPath(path)
 	for _, part := range parts {
 		key := strings.TrimSpace(part)
 		if key == "" {
 			return nil, fmt.Errorf("invalid path segment in %q", path)
+		}
+		// Выбор элемента массива по равенству поля: [field=expected], порядок элементов не важен.
+		if strings.HasPrefix(key, "[") && strings.HasSuffix(key, "]") {
+			field, want, err := parseExtractArrayMatch(key)
+			if err != nil {
+				return nil, err
+			}
+			arr, ok := cur.([]any)
+			if !ok {
+				return nil, fmt.Errorf("segment %q requires current value to be a JSON array", key)
+			}
+			var found map[string]any
+			for _, el := range arr {
+				m, ok := el.(map[string]any)
+				if !ok {
+					continue
+				}
+				got, ok := m[field]
+				if !ok {
+					continue
+				}
+				if jsonScalarEqualString(got, want) {
+					found = m
+					break
+				}
+			}
+			if found == nil {
+				return nil, fmt.Errorf("no array element with %q=%q", field, want)
+			}
+			cur = found
+			continue
+		}
+		// Числовой индекс массива (стабильный порядок).
+		if idx, err := strconv.Atoi(key); err == nil && idx >= 0 {
+			arr, ok := cur.([]any)
+			if !ok {
+				obj, ok := cur.(map[string]any)
+				if ok {
+					next, ok := obj[key]
+					if ok {
+						cur = next
+						continue
+					}
+				}
+				return nil, fmt.Errorf("segment %q is not a JSON array", key)
+			}
+			if idx >= len(arr) {
+				return nil, fmt.Errorf("array index %d out of range (len=%d)", idx, len(arr))
+			}
+			cur = arr[idx]
+			continue
 		}
 		obj, ok := cur.(map[string]any)
 		if !ok {
@@ -772,6 +854,51 @@ func extractJSONPathValue(payload any, path string) (any, error) {
 		cur = next
 	}
 	return cur, nil
+}
+
+// parseExtractArrayMatch разбирает сегмент вида [id=value] или [id="value"].
+// Весь inner не обрезаем TrimSpace — иначе "[ =v]" превращается в "=v" и теряется пустое имя поля.
+func parseExtractArrayMatch(segment string) (field string, want string, err error) {
+	if len(segment) < 2 || segment[0] != '[' || segment[len(segment)-1] != ']' {
+		return "", "", fmt.Errorf("invalid array match segment %q (expected [field=value])", segment)
+	}
+	inner := segment[1 : len(segment)-1]
+	eq := strings.IndexByte(inner, '=')
+	if eq <= 0 || eq >= len(inner)-1 {
+		return "", "", fmt.Errorf("invalid array match segment %q (expected [field=value])", segment)
+	}
+	field = strings.TrimSpace(inner[:eq])
+	want = strings.TrimSpace(inner[eq+1:])
+	if len(want) >= 2 && want[0] == '"' && want[len(want)-1] == '"' {
+		want = want[1 : len(want)-1]
+	}
+	if field == "" {
+		return "", "", fmt.Errorf("empty field in array match %q", segment)
+	}
+	return field, want, nil
+}
+
+// jsonScalarEqualString сравнивает значение из JSON с ожидаемой строкой (после интерполяции пути).
+func jsonScalarEqualString(got any, want string) bool {
+	switch v := got.(type) {
+	case string:
+		return v == want
+	case float64:
+		// encoding/json числа в interface{}.
+		if strings.Contains(want, ".") || strings.ContainsAny(want, "eE") {
+			return fmt.Sprint(v) == want
+		}
+		if i64 := int64(v); float64(i64) == v {
+			return strconv.FormatInt(i64, 10) == want
+		}
+		return fmt.Sprint(v) == want
+	case bool:
+		return (v && want == "true") || (!v && want == "false")
+	case nil:
+		return want == "" || want == "null"
+	default:
+		return fmt.Sprint(got) == want
+	}
 }
 
 // executeKafka отправляет одно сообщение в Kafka-топик шага.

@@ -41,6 +41,9 @@ type Step struct {
 	// Extract из JSON-тела ответа (rest) или сообщения (mq get).
 	// Один путь: extract_var + extract_path.
 	// Несколько: extract — map «имя_переменной: путь.через.точки» (пути с интерполяцией {{var}}).
+	// Путь: ключи объекта через точку; индекс массива — целое (0,1,…); нестабильный порядок —
+	// сегмент [field=значение] выбирает первый элемент массива-объектов с таким полем (пример:
+	// data.operation.values.[id=payment.orderId].value).
 	ExtractVar  string            `yaml:"extract_var,omitempty" json:"extract_var,omitempty"`
 	ExtractPath string            `yaml:"extract_path,omitempty" json:"extract_path,omitempty"`
 	Extract     map[string]string `yaml:"extract,omitempty" json:"extract,omitempty"`
