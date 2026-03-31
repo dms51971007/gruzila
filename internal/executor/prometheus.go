@@ -52,7 +52,7 @@ func InitPrometheusMetrics(scenarioLabel string) *PrometheusMetrics {
 	lastLatencyVec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Name:      "last_latency_ms",
-		Help:      "Last run latency (ms)",
+		Help:      "Average full scenario iteration latency over the last scheduler tick (ms)",
 	}, []string{"scenario"})
 	runningVec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,

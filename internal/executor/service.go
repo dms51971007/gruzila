@@ -43,7 +43,7 @@ type StepMetric struct {
 	Name          string `json:"name"`
 	Type          string `json:"type"`
 	ErrorCount    int64  `json:"error_count"`
-	LastLatencyMs int64  `json:"last_latency_ms"`
+	LastLatencyMs int64  `json:"last_latency_ms"` // средняя задержка шага за последний тик планировщика (мс)
 }
 
 // Metrics — runtime-метрики текущего прогона.
@@ -52,10 +52,10 @@ type Metrics struct {
 	AttemptsCount  int64        `json:"attempts_count"` // всего запущено попыток (success + error + in-flight)
 	SuccessCount   int64        `json:"success_count"`
 	ErrorCount     int64        `json:"error_count"`
-	LastLatency    int64        `json:"last_latency_ms"`
-	AdaptiveTPS    float64      `json:"adaptive_tps"` // динамический ceiling, до которого режем target_tps
-	TargetTPS      float64      `json:"target_tps"`   // к какому TPS стремимся (effectiveTPS)
-	CurrentTPS     float64      `json:"current_tps"`  // сколько реально попыток запустили за последнюю секунду
+	LastLatency    int64        `json:"last_latency_ms"` // средняя полная длительность итерации сценария за последний тик (мс)
+	AdaptiveTPS    float64      `json:"adaptive_tps"`    // динамический ceiling, до которого режем target_tps
+	TargetTPS      float64      `json:"target_tps"`      // к какому TPS стремимся (effectiveTPS)
+	CurrentTPS     float64      `json:"current_tps"`     // сколько реально попыток запустили за последнюю секунду
 	WorkerPoolSize int64        `json:"worker_pool_size"`
 	BusyWorkers    int64        `json:"busy_workers"`
 	FreeWorkers    int64        `json:"free_workers"`
@@ -84,7 +84,9 @@ type Service struct {
 	attemptsCount atomic.Int64
 	successCount  atomic.Int64
 	errorCount    atomic.Int64
-	lastLatency   atomic.Int64
+	lastLatency   atomic.Int64 // среднее за последний тик (полная итерация сценария)
+	latencySumMs  atomic.Int64 // накопление за текущий интервал тика
+	latencyCount  atomic.Int64
 	lastAttempts  atomic.Int64
 	activeWorkers atomic.Int64
 	// resetAdaptiveCap сигнализирует runLoop немедленно сбросить adaptive cap
@@ -102,7 +104,9 @@ type Service struct {
 
 type stepAgg struct {
 	errors atomic.Int64
-	lastMs atomic.Int64
+	lastMs atomic.Int64 // среднее за последний тик (мс)
+	sumMs  atomic.Int64
+	count  atomic.Int64
 }
 
 // NewService загружает сценарий с диска и инициализирует Service.
@@ -152,6 +156,8 @@ func (s *Service) Start(cfg RunConfig) error {
 	s.successCount.Store(0)
 	s.errorCount.Store(0)
 	s.lastLatency.Store(0)
+	s.latencySumMs.Store(0)
+	s.latencyCount.Store(0)
 	s.activeWorkers.Store(0)
 	s.resetAdaptiveCap.Store(true)
 	s.stepMu.Lock()
@@ -284,6 +290,8 @@ func (s *Service) ResetMetrics() error {
 	s.successCount.Store(0)
 	s.errorCount.Store(0)
 	s.lastLatency.Store(0)
+	s.latencySumMs.Store(0)
+	s.latencyCount.Store(0)
 	s.lastAttempts.Store(0)
 	s.status.LastError = ""
 	if !running {
@@ -338,7 +346,8 @@ func (s *Service) recordStepFinish(stepIndex int, step scenario.Step, durationMs
 	if err != nil {
 		s.stepAggs[stepIndex].errors.Add(1)
 	}
-	s.stepAggs[stepIndex].lastMs.Store(durationMs)
+	s.stepAggs[stepIndex].sumMs.Add(durationMs)
+	s.stepAggs[stepIndex].count.Add(1)
 	s.stepMu.RUnlock()
 }
 
@@ -395,7 +404,8 @@ func (s *Service) runScenarioIteration(r *runner) {
 		err = r.executeScenario(s.active, transactionNumber)
 	}()
 	latency := time.Since(started).Milliseconds()
-	s.lastLatency.Store(latency)
+	s.latencySumMs.Add(latency)
+	s.latencyCount.Add(1)
 
 	if err != nil {
 		s.errorCount.Add(1)
@@ -423,6 +433,30 @@ func (s *Service) scenarioWorker(r *runner, jobCh <-chan struct{}, sem chan stru
 // 2) ставит задачи в очередь воркерам (без go на каждую итерацию);
 // 3) пересчитывает current TPS и adaptive cap;
 // 4) обновляет status и Prometheus-метрики.
+// flushLatencyTickWindow завершает окно между тиками таймера: считает средние задержки
+// по полной итерации сценария и по каждому шагу, обнуляет накопители.
+func (s *Service) flushLatencyTickWindow() {
+	sum := s.latencySumMs.Swap(0)
+	cnt := s.latencyCount.Swap(0)
+	if cnt > 0 {
+		s.lastLatency.Store(sum / cnt)
+	} else {
+		s.lastLatency.Store(0)
+	}
+	s.stepMu.RLock()
+	for i := range s.stepAggs {
+		ss := &s.stepAggs[i]
+		stSum := ss.sumMs.Swap(0)
+		stCnt := ss.count.Swap(0)
+		if stCnt > 0 {
+			ss.lastMs.Store(stSum / stCnt)
+		} else {
+			ss.lastMs.Store(0)
+		}
+	}
+	s.stepMu.RUnlock()
+}
+
 func (s *Service) runLoop(stop <-chan struct{}) {
 	r := newRunner(s.buildVariables, s.recordStepFinish)
 	workers := scenarioWorkerCount()
@@ -466,6 +500,8 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 						s.mu.Unlock()
 					}
 				}()
+
+				s.flushLatencyTickWindow()
 
 				now := time.Now()
 				var elapsedSec float64
