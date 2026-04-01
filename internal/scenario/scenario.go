@@ -47,7 +47,7 @@ type Step struct {
 	ExtractVar  string            `yaml:"extract_var,omitempty" json:"extract_var,omitempty"`
 	ExtractPath string            `yaml:"extract_path,omitempty" json:"extract_path,omitempty"`
 	Extract     map[string]string `yaml:"extract,omitempty" json:"extract,omitempty"`
-	// Headers: для rest — HTTP-заголовки; для mq put дополнительно сливаются с mq_headers (см. executor).
+	// Headers: для rest — HTTP-заголовки; для mq put участвуют в итоговых STOMP-заголовках (см. executor.mqHeaderSource).
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	// Подключаемые профили с повторяющимися настройками.
 	// Пути относительные к файлу сценария.
@@ -64,12 +64,15 @@ type Step struct {
 	MQAction   string            `yaml:"mq_action,omitempty" json:"mq_action,omitempty"` // put|get
 	MQSelector string            `yaml:"mq_selector,omitempty" json:"mq_selector,omitempty"`
 	MQHeaders  map[string]string `yaml:"mq_headers,omitempty" json:"mq_headers,omitempty"`
-	MQConnName string            `yaml:"mq_conn_name,omitempty" json:"mq_conn_name,omitempty"`
-	MQChannel  string            `yaml:"mq_channel,omitempty" json:"mq_channel,omitempty"`
-	MQQueueMgr string            `yaml:"mq_queue_manager,omitempty" json:"mq_queue_manager,omitempty"`
-	MQUser     string            `yaml:"mq_user,omitempty" json:"mq_user,omitempty"`
-	MQPassword string            `yaml:"mq_password,omitempty" json:"mq_password,omitempty"`
-	MQWaitMS   int               `yaml:"mq_wait_ms,omitempty" json:"mq_wait_ms,omitempty"`
+	// MQHeadersBase: при LoadFromFile — слой из mq_profile.mq_headers, затем mq_headers_profile (файл перекрывает профиль).
+	// В рантайме ниже по приоритету, чем headers и mq_headers шага.
+	MQHeadersBase map[string]string `yaml:"-" json:"-"`
+	MQConnName    string            `yaml:"mq_conn_name,omitempty" json:"mq_conn_name,omitempty"`
+	MQChannel     string            `yaml:"mq_channel,omitempty" json:"mq_channel,omitempty"`
+	MQQueueMgr    string            `yaml:"mq_queue_manager,omitempty" json:"mq_queue_manager,omitempty"`
+	MQUser        string            `yaml:"mq_user,omitempty" json:"mq_user,omitempty"`
+	MQPassword    string            `yaml:"mq_password,omitempty" json:"mq_password,omitempty"`
+	MQWaitMS      int               `yaml:"mq_wait_ms,omitempty" json:"mq_wait_ms,omitempty"`
 	// MQ TLS/SSL (Artemis STOMP over TLS)
 	MQTLS           bool   `yaml:"mq_tls,omitempty" json:"mq_tls,omitempty"`
 	MQTLSInsecure   bool   `yaml:"mq_tls_insecure,omitempty" json:"mq_tls_insecure,omitempty"` // skip cert verification (dev only)
@@ -175,8 +178,13 @@ func applyStepProfiles(scenarioPath string, sc *Scenario) error {
 			if err != nil {
 				return fmt.Errorf("step[%d] mq_headers_profile: %w", i, err)
 			}
-			if len(sc.Steps[i].MQHeaders) == 0 {
-				sc.Steps[i].MQHeaders = h
+			if len(h) > 0 {
+				if sc.Steps[i].MQHeadersBase == nil {
+					sc.Steps[i].MQHeadersBase = make(map[string]string, len(h))
+				}
+				for k, v := range h {
+					sc.Steps[i].MQHeadersBase[k] = v
+				}
 			}
 		}
 	}
@@ -323,8 +331,13 @@ func mergeMQProfile(st *Step, p mqProfile) {
 	if st.MQTLSCipherSuites == "" {
 		st.MQTLSCipherSuites = p.MQTLSCipherSuites
 	}
-	if len(st.MQHeaders) == 0 && len(p.MQHeaders) > 0 {
-		st.MQHeaders = p.MQHeaders
+	if len(p.MQHeaders) > 0 {
+		if st.MQHeadersBase == nil {
+			st.MQHeadersBase = make(map[string]string, len(p.MQHeaders))
+		}
+		for k, v := range p.MQHeaders {
+			st.MQHeadersBase[k] = v
+		}
 	}
 }
 

@@ -1527,13 +1527,18 @@ func interpolate(vars map[string]string, src string) string {
 	return strings.NewReplacer(pairs...).Replace(src)
 }
 
-// mqHeaderSource объединяет step.headers и step.mq_headers для STOMP SEND.
-// Раньше учитывались только mq_headers — новые ключи из headers: в YAML терялись.
+// mqHeaderSource собирает STOMP-заголовки для SEND. Приоритет (слабее → сильнее):
+// mq_profile.mq_headers + mq_headers_profile (в Step.MQHeadersBase при загрузке),
+// затем headers шага, затем mq_headers шага.
 func mqHeaderSource(step scenario.Step) map[string]string {
-	if len(step.Headers) == 0 && len(step.MQHeaders) == 0 {
+	if len(step.MQHeadersBase) == 0 && len(step.Headers) == 0 && len(step.MQHeaders) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(step.Headers)+len(step.MQHeaders))
+	n := len(step.MQHeadersBase) + len(step.Headers) + len(step.MQHeaders)
+	out := make(map[string]string, n)
+	for k, v := range step.MQHeadersBase {
+		out[k] = v
+	}
 	for k, v := range step.Headers {
 		out[k] = v
 	}
