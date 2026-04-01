@@ -55,7 +55,7 @@ type Metrics struct {
 	LastLatency    int64        `json:"last_latency_ms"` // средняя полная длительность итерации сценария за последний тик (мс)
 	AdaptiveTPS    float64      `json:"adaptive_tps"`    // динамический ceiling, до которого режем target_tps
 	TargetTPS      float64      `json:"target_tps"`      // к какому TPS стремимся (effectiveTPS)
-	CurrentTPS     float64      `json:"current_tps"`     // сколько реально попыток запустили за последнюю секунду
+	CurrentTPS     float64      `json:"current_tps"`     // сглаженный TPS за интервал между тиками (см. runLoop; после сна не «раздувается»)
 	WorkerPoolSize int64        `json:"worker_pool_size"`
 	BusyWorkers    int64        `json:"busy_workers"`
 	FreeWorkers    int64        `json:"free_workers"`
@@ -390,6 +390,14 @@ func scenarioWorkerCount() int {
 	return scenarioMaxConcurrent
 }
 
+// maxSchedulingCatchUpSec — после длинной паузы (сон ПК, отладчик) не ставим в очередь
+// targetTPS * (весь простой): один тик догоняет не больше N секунд «нормальной» нагрузки.
+const maxSchedulingCatchUpSec = 5.0
+
+// minTPSRateWindowSec — нижняя граница окна для current_tps, если интервал между тиками
+// аномально короткий (срыв таймера после пробуждения и т.п.), иначе деление даёт всплеск на графике.
+const minTPSRateWindowSec = 0.25
+
 // runScenarioIteration выполняет одну попытку сценария (счётчики, panic recover, last_error).
 func (s *Service) runScenarioIteration(r *runner) {
 	transactionNumber := s.attemptsCount.Add(1)
@@ -513,7 +521,7 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 					lastTPSSampleAt = now
 				}
 				if elapsedSec <= 0 {
-					elapsedSec = 1e-6
+					elapsedSec = minTPSRateWindowSec
 				}
 
 				cfg, startedAt := s.currentConfig()
@@ -527,9 +535,16 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				}
 				targetTPS := desiredTPS
 
+				schedElapsed := elapsedSec
+				if schedElapsed > maxSchedulingCatchUpSec {
+					// Долгий разрыв (сон): не копим carry и не штрафуем очередь месяцем «долга».
+					carryIterations = 0
+					schedElapsed = maxSchedulingCatchUpSec
+				}
+
 				// Планируем количество запусков по фактическому временному окну.
 				// Это исправляет искажение TPS на дробных значениях (например 0.2, 0.5, 1.7).
-				planned := targetTPS*elapsedSec + carryIterations
+				planned := targetTPS*schedElapsed + carryIterations
 				if planned < 0 {
 					planned = 0
 				}
@@ -553,7 +568,12 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				// Реальный TPS: прирост attempts_count за интервал между тиками.
 				currentAttempts := s.attemptsCount.Load()
 				prevAttempts := s.lastAttempts.Swap(currentAttempts)
-				currentTPS := float64(currentAttempts-prevAttempts) / elapsedSec
+				deltaAttempts := currentAttempts - prevAttempts
+				rateWindow := elapsedSec
+				if rateWindow < minTPSRateWindowSec {
+					rateWindow = minTPSRateWindowSec
+				}
+				currentTPS := float64(deltaAttempts) / rateWindow
 
 				s.mu.Lock()
 				s.status.Metrics.AdaptiveTPS = desiredTPS
