@@ -161,6 +161,8 @@ function emptyAttemptSlots() {
     errors: [...z],
     lastSample: null,
     lastRefresh: null,
+    /** Время предыдущего опроса (Date.now); для TPS после дельты / фактический интервал (фоновая вкладка троттлит setInterval). */
+    lastPollAt: null,
   };
 }
 
@@ -177,6 +179,7 @@ function migrateAttemptRunState(raw) {
       errors: [...raw.errors],
       lastSample: raw.lastSample ?? null,
       lastRefresh: raw.lastRefresh ?? null,
+      lastPollAt: raw.lastPollAt ?? null,
     };
   }
   return emptyAttemptSlots();
@@ -234,24 +237,37 @@ function mergeAttemptMetricsHistory(rows, prev, refreshTs) {
     let errors = [...state.errors];
     let lastRefresh = state.lastRefresh;
 
-    if (state.lastSample != null) {
+    const elapsedSec =
+      state.lastPollAt != null ? Math.max((refreshTs - state.lastPollAt) / 1000, 0.25) : null;
+
+    if (state.lastSample != null && elapsedSec != null) {
       const da = deltaNonNeg(cur.attempts, state.lastSample.attempts);
       const ds = deltaNonNeg(cur.success, state.lastSample.success);
       const de = deltaNonNeg(cur.errors, state.lastSample.errors);
       if (da !== 0 || ds !== 0 || de !== 0) {
+        const ra = da / elapsedSec;
+        const rs = ds / elapsedSec;
+        const re = de / elapsedSec;
         if (lastRefresh === refreshTs) {
-          attempts[STEP_LATENCY_CHART_BUCKETS - 1] = da;
-          success[STEP_LATENCY_CHART_BUCKETS - 1] = ds;
-          errors[STEP_LATENCY_CHART_BUCKETS - 1] = de;
+          attempts[STEP_LATENCY_CHART_BUCKETS - 1] = ra;
+          success[STEP_LATENCY_CHART_BUCKETS - 1] = rs;
+          errors[STEP_LATENCY_CHART_BUCKETS - 1] = re;
         } else {
-          attempts = [...attempts.slice(1), da];
-          success = [...success.slice(1), ds];
-          errors = [...errors.slice(1), de];
+          attempts = [...attempts.slice(1), ra];
+          success = [...success.slice(1), rs];
+          errors = [...errors.slice(1), re];
         }
         lastRefresh = refreshTs;
       }
     }
-    next[k] = { attempts, success, errors, lastSample: cur, lastRefresh };
+    next[k] = {
+      attempts,
+      success,
+      errors,
+      lastSample: cur,
+      lastRefresh,
+      lastPollAt: refreshTs,
+    };
   }
   for (const k of Object.keys(next)) {
     if (!k.startsWith("run:")) continue;

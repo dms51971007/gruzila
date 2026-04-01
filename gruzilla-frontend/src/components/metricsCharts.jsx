@@ -107,13 +107,13 @@ export function LatencySparkline({
   );
 }
 
-/** Три линии на одной шкале: прирост за опрос → на графике в событиях в секунду (recharts). */
+/** Три линии на одной шкале: значения в бакетах уже «в секунду» (дельта / фактический интервал между опросами). */
 export function AttemptMetricsCombinedChart({
   bucketsAttempts,
   bucketsSuccess,
   bucketsErrors,
-  /** Секунды между опросами списка executors; из них считается перевод «за опрос» → «в секунду». */
-  pollIntervalSeconds = 5,
+  /** Оставлено для совместимости; масштаб не зависит от интервала — см. mergeAttemptMetricsHistory. */
+  pollIntervalSeconds: _pollIntervalSeconds = 5,
 }) {
   const { chartData, yMax } = useMemo(() => {
     const norm = (b) =>
@@ -123,15 +123,12 @@ export function AttemptMetricsCombinedChart({
     const ba = norm(bucketsAttempts);
     const bs = norm(bucketsSuccess);
     const be = norm(bucketsErrors);
-    const interval = Number(pollIntervalSeconds);
-    const perSecond =
-      Number.isFinite(interval) && interval > 0 ? 1 / interval : 1;
     const span = Math.max(1, CHART_BUCKETS - 1);
     let m = 1;
     const rows = ba.map((a, i) => {
-      const attempts = a * perSecond;
-      const success = bs[i] * perSecond;
-      const errors = be[i] * perSecond;
+      const attempts = a;
+      const success = bs[i];
+      const errors = be[i];
       m = Math.max(m, attempts, success, errors);
       /* Слева старше (120 с), справа новее (0 с) — как «секунды назад». */
       const secInWindow = ((span - i) * ATTEMPT_CHART_WINDOW_SECONDS) / span;
@@ -140,7 +137,7 @@ export function AttemptMetricsCombinedChart({
     const padded = m * 1.05;
     const yMax = Math.max(5, ceilToMultiple(padded, 5));
     return { chartData: rows, yMax };
-  }, [bucketsAttempts, bucketsSuccess, bucketsErrors, pollIntervalSeconds]);
+  }, [bucketsAttempts, bucketsSuccess, bucketsErrors]);
 
   return (
     <Box
