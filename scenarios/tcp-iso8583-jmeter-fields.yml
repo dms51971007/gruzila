@@ -12,7 +12,8 @@ steps:
   - type: tcp
     name: "iso-0200-moov"
     tcp_addr: "127.0.0.1:9000"
-    tcp_length_prefix: "2be"
+    # 4be — бинарный uint32 BE; 4ascii — 4 байта десятичного текста (как ISO_8859_1 + toInt), напр. "0141"
+    tcp_length_prefix: "4ascii"
     tcp_iso8583_spec: spec87ascii
     tcp_iso8583_fields:
       "0": "0200"

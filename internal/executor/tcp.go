@@ -236,8 +236,28 @@ func tcpWrapLengthPrefix(prefix string, payload []byte) ([]byte, error) {
 		binary.BigEndian.PutUint32(buf[:4], uint32(len(payload)))
 		copy(buf[4:], payload)
 		return buf, nil
+	case "4ascii":
+		n := len(payload)
+		if n > 9999 {
+			return nil, fmt.Errorf("tcp length_prefix 4ascii: payload %d bytes > 9999", n)
+		}
+		head := fmt.Sprintf("%04d", n)
+		buf := make([]byte, 4+len(payload))
+		copy(buf[:4], head)
+		copy(buf[4:], payload)
+		return buf, nil
+	case "6ascii":
+		n := len(payload)
+		if n > 999999 {
+			return nil, fmt.Errorf("tcp length_prefix 6ascii: payload %d bytes > 999999", n)
+		}
+		head := fmt.Sprintf("%06d", n)
+		buf := make([]byte, 6+len(payload))
+		copy(buf[:6], head)
+		copy(buf[6:], payload)
+		return buf, nil
 	default:
-		return nil, fmt.Errorf("tcp_length_prefix: unknown %q (use \"\", 2be, 4be)", prefix)
+		return nil, fmt.Errorf("tcp_length_prefix: unknown %q (use \"\", 2be, 4be, 4ascii, 6ascii)", prefix)
 	}
 }
 
@@ -268,6 +288,28 @@ func tcpReadResponse(conn net.Conn, prefix string, maxBody int, readTimeoutMS in
 			return nil, err
 		}
 		msgLen = int(binary.BigEndian.Uint32(hdr[:]))
+	case "4ascii":
+		var hdr [4]byte
+		if _, err := tcpReadFull(conn, hdr[:], deadline); err != nil {
+			return nil, err
+		}
+		ls := strings.TrimSpace(string(hdr[:]))
+		parsed, err := strconv.Atoi(ls)
+		if err != nil {
+			return nil, fmt.Errorf("tcp read 4ascii: invalid length %q: %w", ls, err)
+		}
+		msgLen = parsed
+	case "6ascii":
+		var hdr [6]byte
+		if _, err := tcpReadFull(conn, hdr[:], deadline); err != nil {
+			return nil, err
+		}
+		ls := strings.TrimSpace(string(hdr[:]))
+		parsed, err := strconv.Atoi(ls)
+		if err != nil {
+			return nil, fmt.Errorf("tcp read 6ascii: invalid length %q: %w", ls, err)
+		}
+		msgLen = parsed
 	default:
 		return nil, fmt.Errorf("tcp read: unknown prefix %q", prefix)
 	}

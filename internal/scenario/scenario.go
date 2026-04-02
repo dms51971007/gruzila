@@ -96,7 +96,7 @@ type Step struct {
 	TCPAddr              string `yaml:"tcp_addr,omitempty" json:"tcp_addr,omitempty"` // host:port
 	TCPDialTimeoutMS     int    `yaml:"tcp_dial_timeout_ms,omitempty" json:"tcp_dial_timeout_ms,omitempty"`
 	TCPReadTimeoutMS     int    `yaml:"tcp_read_timeout_ms,omitempty" json:"tcp_read_timeout_ms,omitempty"`
-	TCPLengthPrefix      string `yaml:"tcp_length_prefix,omitempty" json:"tcp_length_prefix,omitempty"` // "" | "2be" | "4be" (big-endian длина тела)
+	TCPLengthPrefix      string `yaml:"tcp_length_prefix,omitempty" json:"tcp_length_prefix,omitempty"` // "" | 2be | 4be | 4ascii | 6ascii (см. executor/tcp.go)
 	TCPPayload           string `yaml:"tcp_payload,omitempty" json:"tcp_payload,omitempty"`             // байты UTF-8 после подстановок
 	TCPPayloadHex        string `yaml:"tcp_payload_hex,omitempty" json:"tcp_payload_hex,omitempty"`     // hex (пробелы допускаются)
 	TCPReadMaxBytes      int    `yaml:"tcp_read_max_bytes,omitempty" json:"tcp_read_max_bytes,omitempty"`
