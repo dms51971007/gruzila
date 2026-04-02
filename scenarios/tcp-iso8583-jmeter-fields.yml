@@ -4,6 +4,9 @@
 # В Spec87ASCII поле 39 (Response Code) — 2 символа; в UI JMeter было "000" — если у вас 3,
 # нужна другая спецификация (tcp_iso8583_spec) или своя MessageSpec в коде.
 #
+# Если хост парсит MTI[4] + binary bitmap[8] (как String(bytes, ISO_8859_1) + сырые 8 байт),
+# используйте tcp_iso8583_spec: spec87ascii_binmap — то же поле 87ASCII, но растр на проводе бинарный.
+#
 # card — через variables при старте прогона (API), иначе пусто.
 
 name: "tcp-iso8583-jmeter-fields"

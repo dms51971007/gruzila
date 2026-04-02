@@ -2,25 +2,59 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	iso8583lib "github.com/moov-io/iso8583"
+	"github.com/moov-io/iso8583/encoding"
+	"github.com/moov-io/iso8583/field"
+	"github.com/moov-io/iso8583/prefix"
 	"github.com/moov-io/iso8583/specs"
 
 	"gruzilla/internal/scenario"
 )
 
+// spec87ascii_binmap — как spec87ascii (поля в ASCII на проводе), но primary/secondary bitmap
+// — сырые байты (8+8…), как в типичном Kotlin/Java разборе: MTI[4] + binary bitmap, а не 16 hex-символов.
+var (
+	spec87asciiBinMap     *iso8583lib.MessageSpec
+	spec87asciiBinMapOnce sync.Once
+)
+
+func spec87ASCIIBinaryBitmap() *iso8583lib.MessageSpec {
+	spec87asciiBinMapOnce.Do(func() {
+		base := specs.Spec87ASCII
+		out := make(map[int]field.Field, len(base.Fields))
+		for k, v := range base.Fields {
+			out[k] = v
+		}
+		out[1] = field.NewBitmap(&field.Spec{
+			Description: "Bitmap",
+			Enc:         encoding.Binary,
+			Pref:        prefix.Binary.Fixed,
+		})
+		spec87asciiBinMap = &iso8583lib.MessageSpec{
+			Name:   "ISO 8583 v1987 ASCII (binary bitmap)",
+			Fields: out,
+		}
+	})
+	return spec87asciiBinMap
+}
+
 func iso8583MessageSpecByName(name string) (*iso8583lib.MessageSpec, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "spec87ascii":
 		return specs.Spec87ASCII, nil
+	case "spec87ascii_binmap", "spec87_ascii_binary_bitmap":
+		return spec87ASCIIBinaryBitmap(), nil
 	case "spec87hex":
 		return specs.Spec87Hex, nil
 	case "spec87track2":
 		return specs.Spec87Track2, nil
 	default:
-		return nil, fmt.Errorf("unknown tcp_iso8583_spec %q (spec87ascii, spec87hex, spec87track2)", name)
+		return nil, fmt.Errorf("unknown tcp_iso8583_spec %q (spec87ascii, spec87ascii_binmap, spec87hex, spec87track2)", name)
 	}
 }
 
@@ -34,17 +68,26 @@ func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte
 		return nil, nil, err
 	}
 	msg := iso8583lib.NewMessage(sp)
+	type fieldRow struct {
+		id  int
+		tpl string
+	}
+	rows := make([]fieldRow, 0, len(step.TCPISO8583Fields))
 	for key, tpl := range step.TCPISO8583Fields {
 		fid, err := strconv.Atoi(strings.TrimSpace(key))
 		if err != nil || fid < 0 {
 			return nil, nil, fmt.Errorf("tcp_iso8583_fields: invalid field id %q", key)
 		}
-		val, err := expandStepPlaceholders(interpolate(vars, tpl))
+		rows = append(rows, fieldRow{id: fid, tpl: tpl})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	for _, row := range rows {
+		val, err := expandStepPlaceholders(interpolate(vars, row.tpl))
 		if err != nil {
-			return nil, nil, fmt.Errorf("tcp_iso8583_fields[%d]: %w", fid, err)
+			return nil, nil, fmt.Errorf("tcp_iso8583_fields[%d]: %w", row.id, err)
 		}
-		if err := msg.Field(fid, val); err != nil {
-			return nil, nil, fmt.Errorf("iso8583 field %d: %w", fid, err)
+		if err := msg.Field(row.id, val); err != nil {
+			return nil, nil, fmt.Errorf("iso8583 field %d: %w", row.id, err)
 		}
 	}
 	packed, err := msg.Pack()

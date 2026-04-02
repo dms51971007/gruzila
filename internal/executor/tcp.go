@@ -59,12 +59,18 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 		}
 
 		if rawHex != "" {
+			if enc := strings.TrimSpace(step.TCPPayloadEncoding); enc != "" && strings.ToLower(enc) != "utf8" {
+				return fmt.Errorf("tcp_payload_encoding applies only to tcp_payload, not tcp_payload_hex")
+			}
 			payload, err = decodeFlexibleHex(expanded)
 			if err != nil {
 				return fmt.Errorf("tcp hex payload: %w", err)
 			}
 		} else {
-			payload = []byte(expanded)
+			payload, err = encodeTCPPayloadText(expanded, step.TCPPayloadEncoding)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -349,6 +355,30 @@ func tcpReadFull(conn net.Conn, buf []byte, deadline time.Time) (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// encodeTCPPayloadText кодирует строку после плейсхолдеров в байты для tcp_payload.
+// По умолчанию — UTF-8 (как []byte в Go). iso8859_1 — строго U+0000..U+00FF на байт.
+func encodeTCPPayloadText(s, encoding string) ([]byte, error) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "utf8", "utf-8":
+		return []byte(s), nil
+	case "iso8859_1", "iso-8859-1", "latin1", "iso_8859_1":
+		return stringToISO88591(s)
+	default:
+		return nil, fmt.Errorf("tcp_payload_encoding: unknown %q (utf8, iso8859_1)", encoding)
+	}
+}
+
+func stringToISO88591(s string) ([]byte, error) {
+	out := make([]byte, 0, len(s))
+	for _, r := range s {
+		if r > 0xFF {
+			return nil, fmt.Errorf("tcp_payload iso8859_1: rune %U is outside U+0000..U+00FF", r)
+		}
+		out = append(out, byte(r))
+	}
+	return out, nil
 }
 
 func decodeFlexibleHex(s string) ([]byte, error) {
