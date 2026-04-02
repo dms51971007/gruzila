@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -26,10 +27,10 @@ type Scenario struct {
 }
 
 // Step описывает единичное действие сценария.
-// Поля сгруппированы по типам шагов (rest/kafka/db/mq), но лежат в одной
+// Поля сгруппированы по типам шагов (rest/kafka/db/mq/tcp), но лежат в одной
 // структуре для упрощения парсинга YAML и сериализации в API.
 type Step struct {
-	Type     string `yaml:"type" json:"type"` // rest|kafka|db|mq
+	Type     string `yaml:"type" json:"type"` // rest|kafka|db|mq|tcp
 	Name     string `yaml:"name,omitempty" json:"name,omitempty"`
 	Method   string `yaml:"method,omitempty" json:"method,omitempty"`
 	URL      string `yaml:"url,omitempty" json:"url,omitempty"`
@@ -38,7 +39,7 @@ type Step struct {
 	// REST profile includes (relative to scenario file).
 	RestProfile        string `yaml:"rest_profile,omitempty" json:"rest_profile,omitempty"`
 	RestHeadersProfile string `yaml:"rest_headers_profile,omitempty" json:"rest_headers_profile,omitempty"`
-	// Extract из JSON-тела ответа (rest) или сообщения (mq get).
+	// Extract из JSON-тела ответа (rest, tcp при JSON-ответе) или сообщения (mq get).
 	// Один путь: extract_var + extract_path.
 	// Несколько: extract — map «имя_переменной: путь.через.точки» (пути с интерполяцией {{var}}).
 	// Путь: ключи объекта через точку; индекс массива — целое (0,1,…); нестабильный порядок —
@@ -90,6 +91,26 @@ type Step struct {
 	// DB check
 	DBDSN   string `yaml:"db_dsn,omitempty" json:"db_dsn,omitempty"`
 	DBQuery string `yaml:"db_query,omitempty" json:"db_query,omitempty"`
+
+	// TCP (бинарные кадры: ISO 8583 и др.)
+	TCPAddr              string `yaml:"tcp_addr,omitempty" json:"tcp_addr,omitempty"` // host:port
+	TCPDialTimeoutMS     int    `yaml:"tcp_dial_timeout_ms,omitempty" json:"tcp_dial_timeout_ms,omitempty"`
+	TCPReadTimeoutMS     int    `yaml:"tcp_read_timeout_ms,omitempty" json:"tcp_read_timeout_ms,omitempty"`
+	TCPLengthPrefix      string `yaml:"tcp_length_prefix,omitempty" json:"tcp_length_prefix,omitempty"` // "" | "2be" | "4be" (big-endian длина тела)
+	TCPPayload           string `yaml:"tcp_payload,omitempty" json:"tcp_payload,omitempty"`             // байты UTF-8 после подстановок
+	TCPPayloadHex        string `yaml:"tcp_payload_hex,omitempty" json:"tcp_payload_hex,omitempty"`     // hex (пробелы допускаются)
+	TCPReadMaxBytes      int    `yaml:"tcp_read_max_bytes,omitempty" json:"tcp_read_max_bytes,omitempty"`
+	TCPAssertResponseHex string `yaml:"tcp_assert_response_hex,omitempty" json:"tcp_assert_response_hex,omitempty"` // подстрока в hex-ответе
+	// TCPExtract: сырой ответ — срез байт в переменную; значение "offset:length" или "offset:length:hex"
+	TCPExtract map[string]string `yaml:"tcp_extract,omitempty" json:"tcp_extract,omitempty"`
+	// ISO 8583 (github.com/moov-io/iso8583): либо tcp_iso8583_fields вместо tcp_payload*, либо только unpack ответа.
+	TCPISO8583Spec    string            `yaml:"tcp_iso8583_spec,omitempty" json:"tcp_iso8583_spec,omitempty"`       // spec87ascii | spec87hex | spec87track2
+	TCPISO8583Fields  map[string]string `yaml:"tcp_iso8583_fields,omitempty" json:"tcp_iso8583_fields,omitempty"`   // номер поля → значение ({{var}}, {{__now:...}})
+	TCPISO8583Extract map[string]string `yaml:"tcp_iso8583_extract,omitempty" json:"tcp_iso8583_extract,omitempty"` // имя переменной → номер поля ответа
+	TCPISO8583Assert  map[string]string `yaml:"tcp_iso8583_assert,omitempty" json:"tcp_iso8583_assert,omitempty"`   // номер поля → ожидаемое значение
+	TCPTLS            bool              `yaml:"tcp_tls,omitempty" json:"tcp_tls,omitempty"`
+	TCPTLSInsecure    bool              `yaml:"tcp_tls_insecure,omitempty" json:"tcp_tls_insecure,omitempty"`
+	TCPTLSServerName  string            `yaml:"tcp_tls_server_name,omitempty" json:"tcp_tls_server_name,omitempty"`
 
 	Assert map[string]any `yaml:"assert,omitempty" json:"assert,omitempty"`
 }
@@ -375,8 +396,20 @@ func Validate(sc Scenario) error {
 				return fmt.Errorf("step[%d].db_query is required for db", i)
 			}
 		case "mq":
+		case "tcp":
+			if st.TCPAddr == "" {
+				return fmt.Errorf("step[%d].tcp_addr is required for tcp", i)
+			}
+			iso := len(st.TCPISO8583Fields) > 0
+			raw := strings.TrimSpace(st.TCPPayload) != "" || strings.TrimSpace(st.TCPPayloadHex) != ""
+			if iso && raw {
+				return fmt.Errorf("step[%d] tcp: either tcp_iso8583_fields or tcp_payload/tcp_payload_hex, not both", i)
+			}
+			if !iso && !raw {
+				return fmt.Errorf("step[%d] tcp: set tcp_iso8583_fields or tcp_payload or tcp_payload_hex", i)
+			}
 		default:
-			return fmt.Errorf("step[%d].type must be one of: rest, kafka, db, mq", i)
+			return fmt.Errorf("step[%d].type must be one of: rest, kafka, db, mq, tcp", i)
 		}
 	}
 

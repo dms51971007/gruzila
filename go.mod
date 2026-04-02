@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/go-stomp/stomp v2.1.4+incompatible
 	github.com/jackc/pgx/v5 v5.8.0
+	github.com/moov-io/iso8583 v0.25.3
 	github.com/prometheus/client_golang v1.21.0
 	github.com/segmentio/kafka-go v0.4.50
 	github.com/spf13/cobra v1.10.2
@@ -28,6 +29,7 @@ require (
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
+	github.com/yerden/go-util v1.1.4 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect

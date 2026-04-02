@@ -718,6 +718,8 @@ func (r *runner) executeStep(step scenario.Step, vars map[string]string) error {
 		return r.executeDB(step, vars)
 	case "mq":
 		return r.executeMQ(step, vars)
+	case "tcp":
+		return r.executeTCP(step, vars)
 	default:
 		return fmt.Errorf("unsupported step type: %s", step.Type)
 	}

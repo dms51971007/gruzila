@@ -1,0 +1,38 @@
+# ISO 8583 через moov-io/iso8583 (Spec87ASCII): те же поля, что на скриншоте JMeter.
+# Документация библиотеки: https://github.com/moov-io/iso8583
+#
+# В Spec87ASCII поле 39 (Response Code) — 2 символа; в UI JMeter было "000" — если у вас 3,
+# нужна другая спецификация (tcp_iso8583_spec) или своя MessageSpec в коде.
+#
+# card — через variables при старте прогона (API), иначе пусто.
+
+name: "tcp-iso8583-jmeter-fields"
+description: "TCP ISO8583 (moov-io), поля как в JMeter UI"
+steps:
+  - type: tcp
+    name: "iso-0200-moov"
+    tcp_addr: "127.0.0.1:9000"
+    tcp_length_prefix: "2be"
+    tcp_iso8583_spec: spec87ascii
+    tcp_iso8583_fields:
+      "0": "0200"
+      "3": "000000"
+      "4": "00000000{{__randDigits:4}}"
+      "7": "{{__now:0102150405}}"
+      "11": "{{__randDigits:6}}"
+      "12": "{{__now:150405}}"
+      "22": "026"
+      "24": "200"
+      "25": "00"
+      "35": "{{card}}=30011220119523970000"
+      "41": "00730{{TransactionNumber}}"
+      "42": "000000000730{{TransactionNumber}}"
+      "49": "810"
+    tcp_read_timeout_ms: 30000
+    tcp_read_max_bytes: 65536
+    tcp_iso8583_extract:
+      rc: "39"
+    tcp_iso8583_assert:
+      "39": "00"
+    # Дополнительно: подстрока в hex-дампе (совместимо с сырым ответом)
+    # tcp_assert_response_hex: "3030"
