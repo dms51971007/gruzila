@@ -1,42 +1,27 @@
-# ISO 8583 через moov-io/iso8583 (Spec87ASCII): те же поля, что на скриншоте JMeter.
-# Документация библиотеки: https://github.com/moov-io/iso8583
+# ISO 8583 (moov-io), минимальный 0200 под хост с 4ascii-длиной и binary bitmap.
+# tcp_iso8583_spec: spec87ascii_binmap — MTI[4] + сырой растр, как в типичном Kotlin-разборе.
 #
-# В Spec87ASCII поле 39 (Response Code) — 2 символа; в UI JMeter было "000" — если у вас 3,
-# нужна другая спецификация (tcp_iso8583_spec) или своя MessageSpec в коде.
-#
-# Если хост парсит MTI[4] + binary bitmap[8] (как String(bytes, ISO_8859_1) + сырые 8 байт),
-# используйте tcp_iso8583_spec: spec87ascii_binmap — то же поле 87ASCII, но растр на проводе бинарный.
-#
-# card — через variables при старте прогона (API), иначе пусто.
+# Поля 4, 12, 22, 24, 25, 35, 41, 42, 49 убраны: проще стыковка с упрощённым парсером мока
+# (неизвестные биты в bitmap без сдвига offset ломают разбор).
 
 name: "tcp-iso8583-jmeter-fields"
-description: "TCP ISO8583 (moov-io), поля как в JMeter UI"
+description: "TCP ISO8583 (moov-io), минимальные поля 0200"
 steps:
   - type: tcp
     name: "iso-0200-moov"
     tcp_addr: "127.0.0.1:9000"
-    # 4be — бинарный uint32 BE; 4ascii — 4 байта десятичного текста (как ISO_8859_1 + toInt), напр. "0141"
     tcp_length_prefix: "4ascii"
-    tcp_iso8583_spec: spec87ascii
+    tcp_iso8583_spec: spec87ascii_binmap
     tcp_iso8583_fields:
       "0": "0200"
       "3": "000000"
-      "4": "00000000{{__randDigits:4}}"
       "7": "{{__now:0102150405}}"
       "11": "{{__randDigits:6}}"
-      "12": "{{__now:150405}}"
-      "22": "026"
-      "24": "200"
-      "25": "00"
-      "35": "{{card}}=30011220119523970000"
-      "41": "00730{{TransactionNumber}}"
-      "42": "000000000730{{TransactionNumber}}"
-      "49": "810"
     tcp_read_timeout_ms: 30000
     tcp_read_max_bytes: 65536
     tcp_iso8583_extract:
       rc: "39"
+      rsp_mti: "0" # MTI ответа (0210 на 0200)
     tcp_iso8583_assert:
+      "0": "0210"
       "39": "00"
-    # Дополнительно: подстрока в hex-дампе (совместимо с сырым ответом)
-    # tcp_assert_response_hex: "3030"

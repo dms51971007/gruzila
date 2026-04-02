@@ -126,7 +126,7 @@ func applyTCPISO8583ExtractVars(msg *iso8583lib.Message, extract map[string]stri
 		if err != nil {
 			return fmt.Errorf("tcp_iso8583_extract %q (field %d): %w", name, fid, err)
 		}
-		vars[name] = s
+		vars[name] = normalizeISO8583NumericExtract(fid, s)
 	}
 	return nil
 }
@@ -142,9 +142,67 @@ func applyTCPISO8583Assert(msg *iso8583lib.Message, assert map[string]string, va
 			return fmt.Errorf("tcp_iso8583_assert field %d: %w", fid, err)
 		}
 		want := strings.TrimSpace(interpolate(vars, wantTpl))
-		if got != want {
+		if !iso8583AssertValuesEqual(got, want) {
 			return fmt.Errorf("tcp_iso8583_assert field %d: got %q want %q", fid, got, want)
 		}
 	}
 	return nil
+}
+
+// Частые фиксированные числовые поля 87ASCII: moov GetString может отдавать без ведущих нулей.
+var iso8583NumericFieldWidth = map[int]int{
+	3: 6, 4: 12, 7: 10, 11: 6, 12: 6, 13: 4, 14: 4,
+	18: 4, 24: 3, 25: 2, 37: 12, 39: 2, 41: 8, 42: 15, 49: 3, 70: 3,
+}
+
+func normalizeISO8583NumericExtract(fid int, s string) string {
+	s = strings.TrimSpace(s)
+	w, ok := iso8583NumericFieldWidth[fid]
+	if !ok || w <= 0 || s == "" {
+		return s
+	}
+	if !stringIsAllASCII(s) || !stringIsAllDigits(s) {
+		return s
+	}
+	return padLeftDigits(s, w)
+}
+
+func padLeftDigits(s string, width int) string {
+	if len(s) >= width {
+		return s
+	}
+	return strings.Repeat("0", width-len(s)) + s
+}
+
+func iso8583AssertValuesEqual(got, want string) bool {
+	got, want = strings.TrimSpace(got), strings.TrimSpace(want)
+	if got == want {
+		return true
+	}
+	if !stringIsAllDigits(got) || !stringIsAllDigits(want) {
+		return false
+	}
+	w := max(len(got), len(want))
+	return padLeftDigits(got, w) == padLeftDigits(want, w)
+}
+
+func stringIsAllASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func stringIsAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

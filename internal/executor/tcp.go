@@ -156,9 +156,17 @@ func (r *runner) tcpHandleResponse(step scenario.Step, vars map[string]string, r
 		return err
 	}
 	if unpackSpec != nil && (len(step.TCPISO8583Extract) > 0 || len(step.TCPISO8583Assert) > 0) {
+		if len(resp) == 0 {
+			return fmt.Errorf("tcp iso8583: empty response body")
+		}
 		msg := iso8583lib.NewMessage(unpackSpec)
 		if err := msg.Unpack(resp); err != nil {
-			return fmt.Errorf("tcp iso8583 unpack: %w", err)
+			pre := resp
+			const preMax = 64
+			if len(pre) > preMax {
+				pre = pre[:preMax]
+			}
+			return fmt.Errorf("tcp iso8583 unpack: %w (first %d bytes hex=%s)", err, len(pre), hex.EncodeToString(pre))
 		}
 		if err := applyTCPISO8583ExtractVars(msg, step.TCPISO8583Extract, vars); err != nil {
 			return err
@@ -167,7 +175,8 @@ func (r *runner) tcpHandleResponse(step scenario.Step, vars map[string]string, r
 			return err
 		}
 	}
-	if stepNeedsJSONExtract(step) {
+	// Бинарный ISO-ответ не JSON — не вызывать json.Unmarshal, если задан iso8583 extract/assert.
+	if stepNeedsJSONExtract(step) && len(step.TCPISO8583Extract) == 0 && len(step.TCPISO8583Assert) == 0 {
 		var root any
 		if err := json.Unmarshal(resp, &root); err != nil {
 			return fmt.Errorf("tcp extract: response is not JSON (%v); use tcp_extract (offset:length) or tcp_iso8583_extract", err)

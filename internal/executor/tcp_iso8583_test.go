@@ -82,3 +82,43 @@ func TestSpec87ASCIIBinaryBitmapUnpackRoundTrip(t *testing.T) {
 		t.Fatalf("field 3: got %q", got)
 	}
 }
+
+func TestISO8583AssertToleratesLeadingZeros(t *testing.T) {
+	if !iso8583AssertValuesEqual("0", "00") || !iso8583AssertValuesEqual("00", "0") {
+		t.Fatal("digit assert should treat 0 and 00 as equal")
+	}
+	if iso8583AssertValuesEqual("01", "10") {
+		t.Fatal("distinct codes must not match")
+	}
+}
+
+func TestNormalizeISO8583ExtractField39(t *testing.T) {
+	if got := normalizeISO8583NumericExtract(39, "0"); got != "00" {
+		t.Fatalf("field 39 extract: got %q want 00", got)
+	}
+}
+
+func TestISO8583UnpackMTIField0(t *testing.T) {
+	step := scenario.Step{
+		TCPISO8583Spec: "spec87ascii_binmap",
+		TCPISO8583Fields: map[string]string{
+			"0":  "0210",
+			"39": "00",
+		},
+	}
+	packed, sp, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := iso8583lib.NewMessage(sp)
+	if err := msg.Unpack(packed); err != nil {
+		t.Fatal(err)
+	}
+	mti, err := msg.GetString(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mti != "0210" {
+		t.Fatalf("GetString(0): got %q", mti)
+	}
+}
