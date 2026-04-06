@@ -1,7 +1,10 @@
 package executor
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 
 	"gruzilla/internal/api"
@@ -31,16 +34,68 @@ func (h *Handler) SetShutdownFunc(f ShutdownFunc) {
 // Бизнес-методы API намеренно принимают только POST, чтобы избежать
 // случайного изменения состояния через браузерный GET.
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/start", h.onlyPOST(h.start))
-	mux.HandleFunc("/api/v1/stop", h.onlyPOST(h.stop))
-	mux.HandleFunc("/api/v1/update", h.onlyPOST(h.update))
-	mux.HandleFunc("/api/v1/status", h.onlyPOST(h.status))
-	mux.HandleFunc("/api/v1/metrics", h.onlyPOST(h.metrics))
-	mux.HandleFunc("/api/v1/reload", h.onlyPOST(h.reload))
-	mux.HandleFunc("/api/v1/reset_metrics", h.onlyPOST(h.resetMetrics))
-	mux.HandleFunc("/api/v1/shutdown", h.onlyPOST(h.shutdown))
+	h.handlePOST(mux, "/api/v1/start", h.start)
+	h.handlePOST(mux, "/api/v1/stop", h.stop)
+	h.handlePOST(mux, "/api/v1/update", h.update)
+	h.handlePOST(mux, "/api/v1/status", h.status)
+	h.handlePOST(mux, "/api/v1/metrics", h.metrics)
+	h.handlePOST(mux, "/api/v1/reload", h.reload)
+	h.handlePOST(mux, "/api/v1/reset_metrics", h.resetMetrics)
+	h.handlePOST(mux, "/api/v1/shutdown", h.shutdown)
 	// Prometheus scrape endpoint (GET, no auth)
 	mux.Handle("/metrics", promhttp.Handler())
+}
+
+// handlePOST регистрирует POST-обработчик; при включённом trafficLogs пишет тело запроса и ответа в log.
+func (h *Handler) handlePOST(mux *http.ServeMux, path string, fn http.HandlerFunc) {
+	next := h.onlyPOST(fn)
+	if h.svc.trafficLogs {
+		next = h.onlyPOST(h.withTrafficLog(fn))
+	}
+	mux.HandleFunc(path, next)
+}
+
+type trafficRespWriter struct {
+	http.ResponseWriter
+	status    int
+	committed bool
+	buf       bytes.Buffer
+}
+
+func (tw *trafficRespWriter) WriteHeader(code int) {
+	if tw.committed {
+		return
+	}
+	tw.committed = true
+	tw.status = code
+	tw.ResponseWriter.WriteHeader(code)
+}
+
+func (tw *trafficRespWriter) Write(b []byte) (int, error) {
+	if !tw.committed {
+		tw.WriteHeader(http.StatusOK)
+	}
+	tw.buf.Write(b)
+	return tw.ResponseWriter.Write(b)
+}
+
+func (h *Handler) withTrafficLog(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			api.WriteError(w, "read request body")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		logExecutorTraffic(h.svc.trafficLogs, "executor_http", "recv",
+			fmt.Sprintf("remote=%s path=%s body=%s", r.RemoteAddr, r.URL.Path, string(body)))
+
+		tw := &trafficRespWriter{ResponseWriter: w, status: http.StatusOK}
+		next(tw, r)
+		logExecutorTraffic(h.svc.trafficLogs, "executor_http", "send",
+			fmt.Sprintf("remote=%s path=%s status=%d body=%s", r.RemoteAddr, r.URL.Path, tw.status, tw.buf.String()))
+	}
 }
 
 func (h *Handler) onlyPOST(next http.HandlerFunc) http.HandlerFunc {

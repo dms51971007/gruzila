@@ -100,6 +100,10 @@ type Service struct {
 	// stepMu + stepAggs — счётчики по шагам active.Steps (индекс = позиция в YAML).
 	stepMu   sync.RWMutex
 	stepAggs []stepAgg
+
+	// trafficLogs — детальный лог исходящих/входящих сообщений сценария и HTTP API executor.
+	// Включается при старте gruzilla-executor с непустым --log-file (см. config-backend executor_logs_enabled).
+	trafficLogs bool
 }
 
 type stepAgg struct {
@@ -110,7 +114,8 @@ type stepAgg struct {
 }
 
 // NewService загружает сценарий с диска и инициализирует Service.
-func NewService(scenarioPath string) (*Service, error) {
+// trafficLogs: писать в log все принимаемые/отправляемые сообщения (HTTP API executor и шаги сценария).
+func NewService(scenarioPath string, trafficLogs bool) (*Service, error) {
 	sc, err := scenario.LoadFromFile(scenarioPath)
 	if err != nil {
 		return nil, fmt.Errorf("load scenario: %w", err)
@@ -124,9 +129,10 @@ func NewService(scenarioPath string) (*Service, error) {
 				BaseTPS: 1,
 			},
 		},
-		active:     sc,
-		executorID: newUUIDString(),
-		prom:       InitPrometheusMetrics(scenarioPath),
+		active:      sc,
+		executorID:  newUUIDString(),
+		prom:        InitPrometheusMetrics(scenarioPath),
+		trafficLogs: trafficLogs,
 	}, nil
 }
 
@@ -466,7 +472,7 @@ func (s *Service) flushLatencyTickWindow() {
 }
 
 func (s *Service) runLoop(stop <-chan struct{}) {
-	r := newRunner(s.buildVariables, s.recordStepFinish)
+	r := newRunner(s.buildVariables, s.recordStepFinish, s.trafficLogs)
 	workers := scenarioWorkerCount()
 	log.Printf("runLoop started: workers=%d max_inflight=%d queue_size=%d",
 		workers, scenarioMaxConcurrent, scenarioMaxConcurrent)
@@ -642,6 +648,7 @@ type runner struct {
 	httpClient   *http.Client
 	buildVars    func() map[string]string
 	onStepFinish func(stepIndex int, step scenario.Step, durationMs int64, err error)
+	trafficLogs  bool
 	kafkaMu      sync.Mutex
 	kafkaWriter  map[string]*kafka.Writer
 	dbMu         sync.Mutex
@@ -649,13 +656,14 @@ type runner struct {
 }
 
 // newRunner создаёт runner с переиспользуемыми HTTP/Kafka/DB-клиентами.
-func newRunner(buildVars func() map[string]string, onStepFinish func(int, scenario.Step, int64, error)) *runner {
+func newRunner(buildVars func() map[string]string, onStepFinish func(int, scenario.Step, int64, error), trafficLogs bool) *runner {
 	return &runner{
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
 		buildVars:    buildVars,
 		onStepFinish: onStepFinish,
+		trafficLogs:  trafficLogs,
 		kafkaWriter:  make(map[string]*kafka.Writer),
 		dbPool:       make(map[string]*sql.DB),
 	}
@@ -748,6 +756,9 @@ func (r *runner) executeREST(step scenario.Step, vars map[string]string) error {
 		req.Header.Set(interpolate(vars, k), interpolate(vars, v))
 	}
 
+	src := fmt.Sprintf("rest %s %s", method, url)
+	r.logTraffic(src, "send", bodyStr)
+
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("http call: %w", err)
@@ -757,6 +768,8 @@ func (r *runner) executeREST(step scenario.Step, vars map[string]string) error {
 	if err != nil {
 		return fmt.Errorf("read response body: %w", err)
 	}
+
+	r.logTraffic(src, "recv", fmt.Sprintf("status=%d body=%s", resp.StatusCode, string(respBody)))
 
 	if expected, ok := getExpectedStatus(step.Assert); ok && resp.StatusCode != expected {
 		return fmt.Errorf("unexpected status: got %d want %d", resp.StatusCode, expected)
@@ -988,6 +1001,9 @@ func (r *runner) executeKafka(step scenario.Step, vars map[string]string) error 
 		Time:  time.Now().UTC(),
 	}
 
+	r.logTraffic(fmt.Sprintf("kafka topic=%q brokers=%v", topic, brokers), "send",
+		fmt.Sprintf("key=%q value=%s", string(msg.Key), value))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := w.WriteMessages(ctx, msg); err != nil {
@@ -1009,6 +1025,8 @@ func (r *runner) executeDB(step scenario.Step, vars map[string]string) error {
 		return err
 	}
 
+	r.logTraffic("db", "send", fmt.Sprintf("query=%s", query))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	rows, err := db.QueryContext(ctx, query)
@@ -1028,6 +1046,7 @@ func (r *runner) executeDB(step scenario.Step, vars map[string]string) error {
 		if count != expected {
 			return fmt.Errorf("unexpected rows count: got %d want %d", count, expected)
 		}
+		r.logTraffic("db", "recv", fmt.Sprintf("rows=%d", count))
 		return nil
 	}
 
@@ -1037,6 +1056,7 @@ func (r *runner) executeDB(step scenario.Step, vars map[string]string) error {
 		}
 		return errors.New("db query returned no rows")
 	}
+	r.logTraffic("db", "recv", "at_least_one_row")
 	return nil
 }
 
@@ -1202,8 +1222,11 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 			}
 			vars[k] = v
 		}
+		mqSrc := fmt.Sprintf("mq queue=%q conn=%s action=put", queue, connName)
+		r.logTraffic(mqSrc, "send", bodyStr)
 		return cf.Put(queue, bodyStr, headers)
 	case "get":
+		mqSrcGet := fmt.Sprintf("mq queue=%q conn=%s action=get", queue, connName)
 		resolvedAssert := interpolateAssert(step.Assert, vars)
 		waitMS := step.MQWaitMS
 		if waitMS <= 0 {
@@ -1241,6 +1264,7 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 			if msg == "" {
 				continue
 			}
+			r.logTraffic(mqSrcGet, "recv", msg)
 
 			if len(resolvedAssert) == 0 {
 				if stepNeedsJSONExtract(step) {

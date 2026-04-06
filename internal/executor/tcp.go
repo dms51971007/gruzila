@@ -130,6 +130,8 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 	if _, err := conn.Write(frame); err != nil {
 		return fmt.Errorf("tcp write: %w", err)
 	}
+	tcpSrc := fmt.Sprintf("tcp %s", addr)
+	r.logTraffic(tcpSrc, "send", hex.EncodeToString(frame))
 
 	resp, err := tcpReadResponse(conn, prefix, readCap, readMS)
 	if err != nil {
@@ -137,6 +139,7 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 	}
 
 	respHex := hex.EncodeToString(resp)
+	r.logTraffic(tcpSrc, "recv", respHex)
 	return r.tcpHandleResponse(step, vars, resp, respHex, isoBuildSpec)
 }
 

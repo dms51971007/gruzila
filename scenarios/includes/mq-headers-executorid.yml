@@ -1,4 +1,6 @@
 mq_headers:
+  # ISO 8601 с миллисекундами и смещением зоны, напр. 2026-04-01T11:42:08.546+03:00 (локальное время процесса)
+  RequestDate: "{{__now:2006-01-02T15:04:05.000-07:00}}"
   JMSMessageID: "{requestId}"
   X_From: "gruzilla"
   X_ServiceID: "service-{executorId}"

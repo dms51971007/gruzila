@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gruzilla/internal/executor"
@@ -33,7 +34,7 @@ func main() {
 		defer logCloser.Close()
 	}
 
-	svc, err := executor.NewService(*scenarioPath)
+	svc, err := executor.NewService(*scenarioPath, strings.TrimSpace(*logFile) != "")
 	if err != nil {
 		log.Fatalf("init service: %v", err)
 	}
