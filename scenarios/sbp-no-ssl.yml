@@ -1,6 +1,9 @@
 # SBP: цепочка MQ request-reply через Artemis STOMP без TLS
 name: "sbp-no-ssl"
 description: "SBP flow: несколько IN/OUT очередей"
+
+load_schedule_profile: "includes/load-schedule-sbp.yml"
+
 steps:
 
   - type: mq

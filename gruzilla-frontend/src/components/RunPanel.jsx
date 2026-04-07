@@ -1,8 +1,10 @@
 import {
-  Chip,
   Button,
   Card,
   CardContent,
+  Checkbox,
+  Chip,
+  FormControlLabel,
   Grid,
   List,
   ListItemButton,
@@ -43,14 +45,45 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
   const [percent, setPercent] = useState(100);
   const [baseTps, setBaseTps] = useState(100);
   const [rampUp, setRampUp] = useState(0);
+  /** true = не применять load_schedule сценария, только Base TPS × percent */
+  const [ignoreLoadSchedule, setIgnoreLoadSchedule] = useState(false);
   const [scenarioDir, setScenarioDir] = useState("scenarios");
   const [scenarios, setScenarios] = useState([]);
   const [selectedScenario, setSelectedScenario] = useState("");
   const [executors, setExecutors] = useState([]);
   const [lastResponse, setLastResponse] = useState(null);
   const [loading, setLoading] = useState(false);
+  /** Сценарий на executor с load_schedule (из /run/status). */
+  const [executorScheduleHint, setExecutorScheduleHint] = useState({
+    hasSchedule: false,
+    maxLoad: null,
+  });
 
   const canControl = useMemo(() => !loading, [loading]);
+
+  const refreshExecutorScheduleHint = async () => {
+    const url = String(executorUrl || "").trim();
+    if (!url) {
+      setExecutorScheduleHint({ hasSchedule: false, maxLoad: null });
+      return;
+    }
+    try {
+      const response = await postApi("/api/v1/run/status", { executor_url: url }, { baseUrl });
+      const data = extractCliData(response.payload);
+      if (!data || typeof data !== "object") {
+        setExecutorScheduleHint({ hasSchedule: false, maxLoad: null });
+        return;
+      }
+      const hasSchedule = data.scenario_has_load_schedule === true;
+      const ml = Number(data.load_schedule_max_load);
+      setExecutorScheduleHint({
+        hasSchedule,
+        maxLoad: Number.isFinite(ml) && ml > 0 ? ml : null,
+      });
+    } catch {
+      setExecutorScheduleHint({ hasSchedule: false, maxLoad: null });
+    }
+  };
 
   const loadScenarios = async () => {
     const response = await postApi("/api/v1/scenarios/list", { dir: scenarioDir }, { baseUrl });
@@ -86,11 +119,43 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
     if (nextAddr) setExecutorAddr(nextAddr);
   }, [selectedExecutorUrl]);
 
+  useEffect(() => {
+    refreshExecutorScheduleHint();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [executorUrl, baseUrl]);
+
+  const followExecutorSchedule =
+    !ignoreLoadSchedule && executorScheduleHint.hasSchedule === true;
+
+  const runPayload = (extra = {}) => {
+    const pct = followExecutorSchedule ? 100 : percent;
+    const bts = followExecutorSchedule
+      ? executorScheduleHint.maxLoad != null && executorScheduleHint.maxLoad > 0
+        ? executorScheduleHint.maxLoad
+        : Math.max(1, Number(baseTps) || 1)
+      : baseTps;
+    return {
+      percent: pct,
+      base_tps: bts,
+      ramp_up_seconds: rampUp,
+      ignore_load_schedule: ignoreLoadSchedule,
+      ...extra,
+    };
+  };
+
   const callRun = async (path, body = {}) => {
     setLoading(true);
     try {
       const response = await postApi(path, { executor_url: executorUrl, ...body }, { baseUrl });
       setLastResponse(response);
+      if (
+        path === "/api/v1/run/status" ||
+        path === "/api/v1/run/start" ||
+        path === "/api/v1/run/update" ||
+        path === "/api/v1/run/reload"
+      ) {
+        await refreshExecutorScheduleHint();
+      }
     } finally {
       setLoading(false);
     }
@@ -116,6 +181,7 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
         setExecutorUrl(`http://localhost${executorAddr}`);
       }
       await loadExecutors();
+      await refreshExecutorScheduleHint();
     } finally {
       setLoading(false);
     }
@@ -186,7 +252,8 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
                   fullWidth
                   type="number"
                   label="Percent"
-                  value={percent}
+                  value={followExecutorSchedule ? 100 : percent}
+                  disabled={loading || followExecutorSchedule}
                   onChange={(e) => setPercent(Number(e.target.value))}
                 />
               </Grid>
@@ -194,8 +261,15 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
                 <TextField
                   fullWidth
                   type="number"
-                  label="Base TPS"
-                  value={baseTps}
+                  label="TPS"
+                  value={
+                    followExecutorSchedule
+                      ? executorScheduleHint.maxLoad != null && executorScheduleHint.maxLoad > 0
+                        ? executorScheduleHint.maxLoad
+                        : Math.max(1, Number(baseTps) || 1)
+                      : baseTps
+                  }
+                  disabled={loading || followExecutorSchedule}
                   onChange={(e) => setBaseTps(Number(e.target.value))}
                 />
               </Grid>
@@ -208,6 +282,19 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
                   onChange={(e) => setRampUp(Number(e.target.value))}
                 />
               </Grid>
+              {executorScheduleHint.hasSchedule ? (
+                <Grid size={{ xs: 12, md: 6 }}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={!ignoreLoadSchedule}
+                        onChange={(e) => setIgnoreLoadSchedule(!e.target.checked)}
+                      />
+                    }
+                    label="По расписанию сценария (иначе только Base TPS × %)"
+                  />
+                </Grid>
+              ) : null}
             </Grid>
 
             <Card variant="outlined">
@@ -247,7 +334,7 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
             </Card>
 
             <Stack direction="row" spacing={1} flexWrap="wrap">
-              <Button disabled={!canControl} variant="contained" onClick={() => callRun("/api/v1/run/start", { percent, base_tps: baseTps, ramp_up_seconds: rampUp })}>
+              <Button disabled={!canControl} variant="contained" onClick={() => callRun("/api/v1/run/start", runPayload())}>
                 Start
               </Button>
               <Button disabled={!canControl || !selectedScenario} variant="outlined" onClick={() => callExecutors("/api/v1/executors/start")}>
@@ -256,7 +343,7 @@ export default function RunPanel({ baseUrl, selectedExecutorUrl, showApiResponse
               <Button disabled={!canControl || !selectedScenario} variant="outlined" onClick={() => callExecutors("/api/v1/executors/restart")}>
                 Restart Executor
               </Button>
-              <Button disabled={!canControl} variant="outlined" onClick={() => callRun("/api/v1/run/update", { percent, base_tps: baseTps, ramp_up_seconds: rampUp })}>
+              <Button disabled={!canControl} variant="outlined" onClick={() => callRun("/api/v1/run/update", runPayload())}>
                 Update
               </Button>
               <Button disabled={!canControl} variant="outlined" onClick={() => callRun("/api/v1/run/status")}>

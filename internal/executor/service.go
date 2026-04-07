@@ -35,6 +35,8 @@ type RunConfig struct {
 	BaseTPS       float64           `json:"base_tps"`
 	RampUpSeconds int               `json:"ramp_up_seconds,omitempty"`
 	Variables     map[string]string `json:"variables,omitempty"`
+	// IgnoreLoadSchedule: true — не применять load_schedule сценария, только base_tps×percent.
+	IgnoreLoadSchedule bool `json:"ignore_load_schedule,omitempty"`
 }
 
 // StepMetric — агрегированная статистика по одному шагу сценария.
@@ -44,6 +46,8 @@ type StepMetric struct {
 	Type          string `json:"type"`
 	ErrorCount    int64  `json:"error_count"`
 	LastLatencyMs int64  `json:"last_latency_ms"` // средняя задержка шага за последний тик планировщика (мс)
+	// LastStepError — текст последней ошибки выполнения шага (обновляется при каждой новой ошибке).
+	LastStepError string `json:"last_step_error,omitempty"`
 }
 
 // Metrics — runtime-метрики текущего прогона.
@@ -54,7 +58,7 @@ type Metrics struct {
 	ErrorCount     int64        `json:"error_count"`
 	LastLatency    int64        `json:"last_latency_ms"` // средняя полная длительность итерации сценария за последний тик (мс)
 	AdaptiveTPS    float64      `json:"adaptive_tps"`    // динамический ceiling, до которого режем target_tps
-	TargetTPS      float64      `json:"target_tps"`      // к какому TPS стремимся (effectiveTPS)
+	TargetTPS      float64      `json:"target_tps"`      // к какому TPS стремимся (RunConfig + load_schedule + ramp-up)
 	CurrentTPS     float64      `json:"current_tps"`     // сглаженный TPS за интервал между тиками (см. runLoop; после сна не «раздувается»)
 	WorkerPoolSize int64        `json:"worker_pool_size"`
 	BusyWorkers    int64        `json:"busy_workers"`
@@ -64,13 +68,19 @@ type Metrics struct {
 
 // Status — полный снимок состояния executor для API /status.
 type Status struct {
-	Running      bool       `json:"running"`
-	ScenarioPath string     `json:"scenario_path"`
-	ScenarioName string     `json:"scenario_name"`
-	Config       RunConfig  `json:"config"`
-	Metrics      Metrics    `json:"metrics"`
-	StartedAt    *time.Time `json:"started_at,omitempty"`
-	LastError    string     `json:"last_error,omitempty"`
+	Running      bool   `json:"running"`
+	ScenarioPath string `json:"scenario_path"`
+	ScenarioName string `json:"scenario_name"`
+	// ScenarioHasLoadSchedule — в загруженном сценарии есть активное load_schedule / профиль.
+	ScenarioHasLoadSchedule bool `json:"scenario_has_load_schedule,omitempty"`
+	// LoadScheduleMaxLoad — поле max_load из расписания (для UI при режиме «по расписанию»).
+	LoadScheduleMaxLoad float64 `json:"load_schedule_max_load,omitempty"`
+	// LoadScheduleSummary — краткое текстовое описание интервалов (для UI).
+	LoadScheduleSummary string     `json:"load_schedule_summary,omitempty"`
+	Config              RunConfig  `json:"config"`
+	Metrics             Metrics    `json:"metrics"`
+	StartedAt           *time.Time `json:"started_at,omitempty"`
+	LastError           string     `json:"last_error,omitempty"`
 }
 
 // Service управляет жизненным циклом сценария, runLoop и счётчиками.
@@ -107,10 +117,22 @@ type Service struct {
 }
 
 type stepAgg struct {
-	errors atomic.Int64
-	lastMs atomic.Int64 // среднее за последний тик (мс)
-	sumMs  atomic.Int64
-	count  atomic.Int64
+	errors    atomic.Int64
+	lastMs    atomic.Int64 // среднее за последний тик (мс)
+	sumMs     atomic.Int64
+	count     atomic.Int64
+	lastErrMu sync.RWMutex
+	lastErr   string // последняя текстовая ошибка шага (для UI)
+}
+
+const stepLastErrMaxRunes = 1024
+
+func truncateStepErrMsg(s string) string {
+	r := []rune(s)
+	if len(r) <= stepLastErrMaxRunes {
+		return s
+	}
+	return string(r[:stepLastErrMaxRunes]) + "…"
 }
 
 // NewService загружает сценарий с диска и инициализирует Service.
@@ -198,29 +220,52 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-// Update применяет изменение конфигурации "на лету" без остановки runLoop.
+// RunUpdatePatch — частичное обновление прогона; IgnoreLoadSchedule != nil меняет флаг игнорирования расписания.
+type RunUpdatePatch struct {
+	Percent            int
+	BaseTPS            float64
+	RampUpSeconds      int
+	IgnoreLoadSchedule *bool
+}
+
+// Update применяет изменение конфигурации "на лету" без остановки runLoop (без смены ignore_load_schedule).
 func (s *Service) Update(cfg RunConfig) error {
+	return s.UpdatePatch(RunUpdatePatch{
+		Percent:       cfg.Percent,
+		BaseTPS:       cfg.BaseTPS,
+		RampUpSeconds: cfg.RampUpSeconds,
+	})
+}
+
+// UpdatePatch объединяет правила Update для числовых полей и опционально меняет IgnoreLoadSchedule.
+func (s *Service) UpdatePatch(patch RunUpdatePatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.running {
 		return ErrNotRunning
 	}
 	tpsChanged := false
-	if cfg.Percent > 0 {
-		if s.status.Config.Percent != cfg.Percent {
-			s.status.Config.Percent = cfg.Percent
+	if patch.Percent > 0 {
+		if s.status.Config.Percent != patch.Percent {
+			s.status.Config.Percent = patch.Percent
 			tpsChanged = true
 		}
 	}
-	if cfg.BaseTPS > 0 {
-		if s.status.Config.BaseTPS != cfg.BaseTPS {
-			s.status.Config.BaseTPS = cfg.BaseTPS
+	if patch.BaseTPS > 0 {
+		if s.status.Config.BaseTPS != patch.BaseTPS {
+			s.status.Config.BaseTPS = patch.BaseTPS
 			tpsChanged = true
 		}
 	}
-	if cfg.RampUpSeconds > 0 {
-		if s.status.Config.RampUpSeconds != cfg.RampUpSeconds {
-			s.status.Config.RampUpSeconds = cfg.RampUpSeconds
+	if patch.RampUpSeconds > 0 {
+		if s.status.Config.RampUpSeconds != patch.RampUpSeconds {
+			s.status.Config.RampUpSeconds = patch.RampUpSeconds
+			tpsChanged = true
+		}
+	}
+	if patch.IgnoreLoadSchedule != nil {
+		if s.status.Config.IgnoreLoadSchedule != *patch.IgnoreLoadSchedule {
+			s.status.Config.IgnoreLoadSchedule = *patch.IgnoreLoadSchedule
 			tpsChanged = true
 		}
 	}
@@ -228,7 +273,6 @@ func (s *Service) Update(cfg RunConfig) error {
 		s.status.Metrics.AdaptiveTPS = 0
 		s.resetAdaptiveCap.Store(true)
 	}
-	// Если позже добавят обновление cfg.Variables через Update — вызвать refreshBaseVarsSnapshotLocked().
 	return nil
 }
 
@@ -236,7 +280,16 @@ func (s *Service) Update(cfg RunConfig) error {
 func (s *Service) Status() Status {
 	s.mu.RLock()
 	st := s.status
+	hasSch := s.active.LoadSchedule != nil && s.active.LoadSchedule.HasSchedule()
 	s.mu.RUnlock()
+	st.ScenarioHasLoadSchedule = hasSch
+	if hasSch && s.active.LoadSchedule != nil {
+		st.LoadScheduleMaxLoad = s.active.LoadSchedule.MaxLoad
+		st.LoadScheduleSummary = s.active.LoadSchedule.BriefSummary()
+	} else {
+		st.LoadScheduleMaxLoad = 0
+		st.LoadScheduleSummary = ""
+	}
 	st.Metrics.AttemptsCount = s.attemptsCount.Load()
 	st.Metrics.SuccessCount = s.successCount.Load()
 	st.Metrics.ErrorCount = s.errorCount.Load()
@@ -349,11 +402,15 @@ func (s *Service) recordStepFinish(stepIndex int, step scenario.Step, durationMs
 		s.stepMu.RUnlock()
 		return
 	}
+	agg := &s.stepAggs[stepIndex]
 	if err != nil {
-		s.stepAggs[stepIndex].errors.Add(1)
+		agg.errors.Add(1)
+		agg.lastErrMu.Lock()
+		agg.lastErr = truncateStepErrMsg(err.Error())
+		agg.lastErrMu.Unlock()
 	}
-	s.stepAggs[stepIndex].sumMs.Add(durationMs)
-	s.stepAggs[stepIndex].count.Add(1)
+	agg.sumMs.Add(durationMs)
+	agg.count.Add(1)
 	s.stepMu.RUnlock()
 }
 
@@ -372,9 +429,14 @@ func (s *Service) stepMetricsSnapshot() []StepMetric {
 			name = st.Type
 		}
 		var ec, lm int64
+		var le string
 		if i < len(s.stepAggs) {
-			ec = s.stepAggs[i].errors.Load()
-			lm = s.stepAggs[i].lastMs.Load()
+			agg := &s.stepAggs[i]
+			ec = agg.errors.Load()
+			lm = agg.lastMs.Load()
+			agg.lastErrMu.RLock()
+			le = agg.lastErr
+			agg.lastErrMu.RUnlock()
 		}
 		out = append(out, StepMetric{
 			Index:         i,
@@ -382,6 +444,7 @@ func (s *Service) stepMetricsSnapshot() []StepMetric {
 			Type:          st.Type,
 			ErrorCount:    ec,
 			LastLatencyMs: lm,
+			LastStepError: le,
 		})
 	}
 	return out
@@ -531,7 +594,10 @@ func (s *Service) runLoop(stop <-chan struct{}) {
 				}
 
 				cfg, startedAt := s.currentConfig()
-				desiredTPS := effectiveTPS(cfg, startedAt)
+				s.mu.RLock()
+				sc := s.active
+				s.mu.RUnlock()
+				desiredTPS := effectiveTPSForScenario(sc, cfg, startedAt, now)
 				if math.IsNaN(desiredTPS) || math.IsInf(desiredTPS, 0) {
 					desiredTPS = 0
 				}
@@ -621,26 +687,36 @@ func (s *Service) currentConfig() (RunConfig, *time.Time) {
 	return s.status.Config, s.status.StartedAt
 }
 
-// effectiveTPS вычисляет целевой TPS с учётом percent и ramp-up.
-// При ramp-up TPS растёт линейно от 0 до base*percent/100.
-func effectiveTPS(cfg RunConfig, startedAt *time.Time) float64 {
-	base := cfg.BaseTPS * float64(cfg.Percent) / 100.0
+// rampMultiplier — 0..1 для линейного ramp-up после Start.
+func rampMultiplier(cfg RunConfig, startedAt *time.Time) float64 {
 	if cfg.RampUpSeconds <= 0 || startedAt == nil {
-		return base
+		return 1
 	}
 	elapsed := time.Since(*startedAt).Seconds()
 	total := float64(cfg.RampUpSeconds)
 	if total <= 0 {
-		return base
+		return 1
 	}
 	progress := elapsed / total
 	if progress <= 0 {
 		return 0
 	}
 	if progress >= 1 {
-		return base
+		return 1
 	}
-	return base * progress
+	return progress
+}
+
+// effectiveTPSForScenario: без load_schedule — base_tps и percent из RunConfig;
+// с load_schedule — max_load * (процент интервала)/100 * (RunConfig.percent)/100, затем ramp-up.
+func effectiveTPSForScenario(sc scenario.Scenario, cfg RunConfig, startedAt *time.Time, wall time.Time) float64 {
+	var base float64
+	if !cfg.IgnoreLoadSchedule && sc.LoadSchedule != nil && sc.LoadSchedule.HasSchedule() {
+		base = sc.LoadSchedule.ScheduledBaseTPS(wall, cfg.Percent)
+	} else {
+		base = cfg.BaseTPS * float64(cfg.Percent) / 100.0
+	}
+	return base * rampMultiplier(cfg, startedAt)
 }
 
 // runner исполняет одну итерацию сценария и держит локальные кэши клиентов.

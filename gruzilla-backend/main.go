@@ -312,11 +312,12 @@ func newUUIDLike() string {
 }
 
 type runBody struct {
-	ExecutorURL   string            `json:"executor_url"`
-	Percent       int               `json:"percent"`
-	BaseTPS       float64           `json:"base_tps"`
-	RampUpSeconds int               `json:"ramp_up_seconds"`
-	Variables     map[string]string `json:"variables"`
+	ExecutorURL        string            `json:"executor_url"`
+	Percent            int               `json:"percent"`
+	BaseTPS            float64           `json:"base_tps"`
+	RampUpSeconds      int               `json:"ramp_up_seconds"`
+	Variables          map[string]string `json:"variables"`
+	IgnoreLoadSchedule *bool             `json:"ignore_load_schedule,omitempty"`
 }
 
 type crudBody struct {
@@ -363,6 +364,9 @@ func (h *handler) runStart(w http.ResponseWriter, r *http.Request) {
 	for k, v := range body.Variables {
 		args = append(args, "--var", fmt.Sprintf("%s=%s", k, v))
 	}
+	if body.IgnoreLoadSchedule != nil && *body.IgnoreLoadSchedule {
+		args = append(args, "--ignore-load-schedule")
+	}
 	h.execCLIAndWrite(w, reqID, args...)
 }
 
@@ -387,6 +391,13 @@ func (h *handler) runUpdate(w http.ResponseWriter, r *http.Request) {
 		"--percent", fmt.Sprintf("%d", body.Percent),
 		"--base-tps", fmt.Sprintf("%v", body.BaseTPS),
 		"--ramp-up-seconds", fmt.Sprintf("%d", body.RampUpSeconds),
+	}
+	if body.IgnoreLoadSchedule != nil {
+		if *body.IgnoreLoadSchedule {
+			args = append(args, "--ignore-load-schedule")
+		} else {
+			args = append(args, "--ignore-load-schedule=false")
+		}
 	}
 	h.execCLIAndWrite(w, reqID, args...)
 }

@@ -133,12 +133,23 @@ func (h *Handler) stop(w http.ResponseWriter, _ *http.Request) {
 
 // update меняет текущую конфигурацию нагрузки без рестарта runLoop.
 func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
-	var cfg RunConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	var body struct {
+		Percent            int     `json:"percent"`
+		BaseTPS            float64 `json:"base_tps"`
+		RampUpSeconds      int     `json:"ramp_up_seconds"`
+		IgnoreLoadSchedule *bool   `json:"ignore_load_schedule,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		api.WriteError(w, "invalid JSON body")
 		return
 	}
-	if err := h.svc.Update(cfg); err != nil {
+	patch := RunUpdatePatch{
+		Percent:            body.Percent,
+		BaseTPS:            body.BaseTPS,
+		RampUpSeconds:      body.RampUpSeconds,
+		IgnoreLoadSchedule: body.IgnoreLoadSchedule,
+	}
+	if err := h.svc.UpdatePatch(patch); err != nil {
 		api.WriteError(w, err.Error())
 		return
 	}

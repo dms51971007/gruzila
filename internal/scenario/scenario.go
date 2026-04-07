@@ -21,9 +21,13 @@ var (
 // Один Scenario состоит из последовательности шагов Step, которые
 // выполняются в указанном порядке в рамках одной итерации.
 type Scenario struct {
-	Name        string `yaml:"name" json:"name"`
-	Description string `yaml:"description,omitempty" json:"description,omitempty"`
-	Steps       []Step `yaml:"steps" json:"steps"`
+	Name         string        `yaml:"name" json:"name"`
+	Description  string        `yaml:"description,omitempty" json:"description,omitempty"`
+	LoadSchedule *LoadSchedule `yaml:"load_schedule,omitempty" json:"load_schedule,omitempty"`
+	// LoadScheduleProfile — путь к YAML с max_load / timezone / intervals (относительно файла сценария), см. includes/*.yml.
+	// Не задавайте одновременно load_schedule и load_schedule_profile.
+	LoadScheduleProfile string `yaml:"load_schedule_profile,omitempty" json:"load_schedule_profile,omitempty"`
+	Steps               []Step `yaml:"steps" json:"steps"`
 }
 
 // Step описывает единичное действие сценария.
@@ -127,6 +131,9 @@ func LoadFromFile(path string) (Scenario, error) {
 	var sc Scenario
 	if err := yaml.Unmarshal(data, &sc); err != nil {
 		return Scenario{}, fmt.Errorf("parse yaml: %w", err)
+	}
+	if err := applyLoadScheduleProfile(path, &sc); err != nil {
+		return Scenario{}, err
 	}
 	if err := applyStepProfiles(path, &sc); err != nil {
 		return Scenario{}, err
@@ -411,6 +418,12 @@ func Validate(sc Scenario) error {
 			}
 		default:
 			return fmt.Errorf("step[%d].type must be one of: rest, kafka, db, mq, tcp", i)
+		}
+	}
+
+	if sc.LoadSchedule != nil {
+		if err := sc.LoadSchedule.Compile(); err != nil {
+			return err
 		}
 	}
 

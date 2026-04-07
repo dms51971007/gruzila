@@ -35,6 +35,25 @@ Default config file: `config-backend.yml` in current working directory.
 
 Environment variables override values loaded from `config-backend.yml`.
 
+## Config file (`config-backend.yml`)
+
+Помимо `addr` и блока `cli`, полезны:
+
+- `cli.default_executor_url` — URL executor по умолчанию для UI/CLI.
+- `cli.executor_logs_enabled` — при `true` и старте executor через API backend передаётся путь лог-файла.
+- `cli.executor_log_file` — шаблон пути (например `logs/executor-{addr}.log`); подстановка `{addr}` из адреса listen executor.
+
+## Run API bodies
+
+Эндпоинты `POST /api/v1/run/start` и `POST /api/v1/run/update` принимают JSON:
+
+- `executor_url` (опционально)
+- `percent`, `base_tps`, `ramp_up_seconds`
+- `variables` (map, опционально) — для start
+- `ignore_load_schedule` (опционально, boolean) — пробрасывается в `gruzilla-cli` как `--ignore-load-schedule` / `--ignore-load-schedule=false` (для `update` оба значения имеют смысл, чтобы явно включить или выключить игнор).
+
+Ответ `run/status` проксирует вывод CLI; в данных статуса executor присутствует `scenario_has_load_schedule`, если в активном сценарии задано расписание нагрузки.
+
 ## Request tracing
 
 - Reads incoming header `X-Request-Id`.

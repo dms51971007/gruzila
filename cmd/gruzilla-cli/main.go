@@ -1028,6 +1028,7 @@ func newRunStartCmd(executorURL *string, output *string) *cobra.Command {
 	var baseTPS float64
 	var rampUp int
 	var variables varsFlag
+	var ignoreLoadSchedule bool
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -1040,6 +1041,9 @@ func newRunStartCmd(executorURL *string, output *string) *cobra.Command {
 				"ramp_up_seconds": rampUp,
 				"variables":       map[string]string(variables),
 			}
+			if ignoreLoadSchedule {
+				body["ignore_load_schedule"] = true
+			}
 			resp, err := client.Call("/api/v1/start", body)
 			if err != nil {
 				return err
@@ -1051,6 +1055,7 @@ func newRunStartCmd(executorURL *string, output *string) *cobra.Command {
 	cmd.Flags().IntVar(&percent, "percent", 100, "load coefficient in percent (1-500)")
 	cmd.Flags().Float64Var(&baseTPS, "base-tps", 10, "base TPS of scenario")
 	cmd.Flags().IntVar(&rampUp, "ramp-up-seconds", 0, "linear ramp-up duration in seconds (0 = no ramp)")
+	cmd.Flags().BoolVar(&ignoreLoadSchedule, "ignore-load-schedule", false, "ignore scenario load_schedule; use base-tps × percent only")
 	cmd.Flags().Var(&variables, "var", "scenario variable in key=value format (repeatable)")
 
 	return cmd
@@ -1093,6 +1098,7 @@ func newRunUpdateCmd(executorURL *string, output *string) *cobra.Command {
 	var percent int
 	var baseTPS float64
 	var rampUp int
+	var ignoreLoadSchedule bool
 
 	cmd := &cobra.Command{
 		Use:   "update",
@@ -1103,6 +1109,9 @@ func newRunUpdateCmd(executorURL *string, output *string) *cobra.Command {
 				"percent":         percent,
 				"base_tps":        baseTPS,
 				"ramp_up_seconds": rampUp,
+			}
+			if cmd.Flags().Changed("ignore-load-schedule") {
+				body["ignore_load_schedule"] = ignoreLoadSchedule
 			}
 			resp, err := client.Call("/api/v1/update", body)
 			if err != nil {
@@ -1115,6 +1124,7 @@ func newRunUpdateCmd(executorURL *string, output *string) *cobra.Command {
 	cmd.Flags().IntVar(&percent, "percent", 0, "load coefficient in percent (1-500). 0 = no change")
 	cmd.Flags().Float64Var(&baseTPS, "base-tps", 0, "base TPS of scenario. 0 = no change")
 	cmd.Flags().IntVar(&rampUp, "ramp-up-seconds", 0, "linear ramp-up duration in seconds (0 = no change)")
+	cmd.Flags().BoolVar(&ignoreLoadSchedule, "ignore-load-schedule", false, "set whether to ignore scenario load_schedule (use --ignore-load-schedule=false to follow schedule)")
 
 	return cmd
 }

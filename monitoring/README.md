@@ -8,7 +8,7 @@
 - `gruzilla_success_total{scenario="..."}` — успешных
 - `gruzilla_errors_total{scenario="..."}` — с ошибкой
 - `gruzilla_current_tps{scenario="..."}` — фактический TPS за последний тик
-- `gruzilla_target_tps{scenario="..."}` — целевой TPS
+- `gruzilla_target_tps{scenario="..."}` — целевой TPS (на executor уже учтены `percent`, ramp-up и при необходимости суточное `load_schedule` сценария; см. корневой `README.md`)
 - `gruzilla_last_latency_ms{scenario="..."}` — латентность последнего запуска (мс)
 - `gruzilla_running{scenario="..."}` — 1 если нагрузка идёт, 0 если остановлена
 

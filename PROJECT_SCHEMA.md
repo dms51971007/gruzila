@@ -132,8 +132,8 @@ Frontend -> backend /api/v1/scenarios/* or /templates/*
 
 On each tick (`internal/executor/service.go`):
 
-1. Read current config (`percent`, `base_tps`, `ramp_up_seconds`, variables).
-2. Calculate effective desired TPS (`effectiveTPS` + ramp-up).
+1. Read current config (`percent`, `base_tps`, `ramp_up_seconds`, `ignore_load_schedule`, variables).
+2. Calculate effective desired TPS (`effectiveTPSForScenario`: при наличии `scenario.LoadSchedule` и `IgnoreLoadSchedule == false` — по суточному расписанию в таймзоне сценария; иначе — `base_tps × percent`; затем ramp-up).
 3. Apply adaptive cap to avoid uncontrolled overload.
 4. Compute iteration count and enqueue that many jobs (non-blocking) for a **fixed worker pool** (`scenarioWorkerCount()`, derived from `GOMAXPROCS`), up to `scenarioMaxConcurrent` (4096) admitted jobs (semaphore + job queue).
 5. Each job (worker):
@@ -155,6 +155,7 @@ Scenario is parsed into:
 
 - `Scenario`:
   - `name`, `description`, `steps[]`
+  - optional `load_schedule` (inline) **or** `load_schedule_profile` (path to YAML with `max_load`, `timezone`, `intervals`); not both
 - `Step`:
   - common fields (`type`, `name`, `body`, `template`, `assert`, ...);
   - transport-specific fields:
@@ -168,8 +169,11 @@ Validation strategy:
 - lightweight structural validation at load time (`internal/scenario.Validate`);
 - deeper runtime checks inside each step executor.
 
+String fields in steps may use executor placeholders after variable interpolation: `{{__now:LAYOUT}}`, `{{__randDigits:N}}`, `{{__randHex:N}}` (`internal/executor/placeholders.go`).
+
 ## 6) Observability
 
+- Optional **traffic log** to a file when executor is started with `--log-file`: step-level inbound/outbound messages (see `internal/executor/traffic_log.go`). Backend can enable a default log path via `config-backend.yml` (`executor_logs_enabled`, `executor_log_file`).
 - Executor exports Prometheus gauges under `/metrics`.
 - Core gauges:
   - attempts/success/errors totals,
@@ -177,6 +181,7 @@ Validation strategy:
   - target TPS,
   - last latency ms,
   - running flag.
+- `Status` JSON includes `scenario_has_load_schedule` when the loaded scenario defines an active load schedule.
 - Backend writes request-scoped logs with `request_id`.
 
 ## 7) Configuration Sources (Backend)
@@ -192,7 +197,7 @@ Important fields:
 - CLI command/args/workdir;
 - backend listen address;
 - default executor URL;
-- executor log-file policy.
+- executor log-file policy (`executor_logs_enabled`, `executor_log_file`).
 
 ## 8) Operational Notes
 

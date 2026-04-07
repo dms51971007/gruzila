@@ -1,0 +1,10 @@
+# Пример суточного расписания для SBP: TPS = max_load × (процент/100) × (percent из UI/100).
+# Ключи intervals — часы 0–23, смена на :00. Подключение: load_schedule_profile: "includes/load-schedule-sbp.yml"
+max_load: 10
+timezone: Europe/Moscow
+intervals:
+  0: 25
+  7: 50
+  9: 100
+  20: 60
+  22: 30

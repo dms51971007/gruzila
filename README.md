@@ -42,9 +42,9 @@ go run ./cmd/gruzilla-cli --output json --executor-url "http://localhost:8081" r
 
 Управление нагрузкой на уже запущенном executor:
 
-- `run start` — старт нагрузки (`--percent`, `--base-tps`, `--ramp-up-seconds`, `--var key=value`)
+- `run start` — старт нагрузки (`--percent`, `--base-tps`, `--ramp-up-seconds`, `--var key=value`, `--ignore-load-schedule`)
 - `run status` — текущий статус и метрики (в т.ч. `metrics.steps`: по каждому шагу сценария — `error_count`, `last_latency_ms`)
-- `run update` — изменение TPS/percent/ramp без рестарта
+- `run update` — изменение TPS/percent/ramp без рестарта (опционально `--ignore-load-schedule` / `--ignore-load-schedule=false`)
 - `run stop` — остановка нагрузки
 - `run reload` — перечитать YAML сценария без перезапуска процесса
 - `run reset-metrics` — обнулить метрики (только при остановленной нагрузке)
@@ -53,6 +53,7 @@ go run ./cmd/gruzilla-cli --output json --executor-url "http://localhost:8081" r
 
 ```powershell
 go run ./cmd/gruzilla-cli run start --executor-url "http://localhost:8081" --percent 100 --base-tps 300 --ramp-up-seconds 180
+go run ./cmd/gruzilla-cli run start --executor-url "http://localhost:8081" --percent 100 --base-tps 50 --ignore-load-schedule
 go run ./cmd/gruzilla-cli run update --executor-url "http://localhost:8081" --base-tps 600
 go run ./cmd/gruzilla-cli run status --executor-url "http://localhost:8081"
 go run ./cmd/gruzilla-cli run reload --executor-url "http://localhost:8081"
@@ -81,6 +82,14 @@ body: '{"RequestID":"{{requestId}}","scenario":"{{scenarioName}}"}'
 ```
 
 Пользовательские переменные из `run start --var key=value` доступны вместе со встроенными.
+
+### Плейсхолдеры времени и случайных значений (в строках шагов)
+
+После подстановки `{{var}}` в полях вроде `body`, `headers`, `mq_headers` executor дополнительно разворачивает:
+
+- `{{__now:LAYOUT}}` — `time.Now()` в формате Go [`time.Format`](https://pkg.go.dev/time#Time.Format) (например `{{__now:2006-01-02T15:04:05}}`); пустой `LAYOUT` даёт строку вида `0102150405`
+- `{{__randDigits:N}}` — `N` десятичных цифр (crypto/rand)
+- `{{__randHex:N}}` — `N` символов hex
 
 ### Шаблоны `.json.tmpl` (Go `text/template`)
 
@@ -178,6 +187,21 @@ body: '{"RequestID":"{{requestId}}","scenario":"{{scenarioName}}"}'
 - `mq_headers_profile` — файл с `mq_headers` (допускается как с корневым `mq_headers:`, так и прямой map)
 
 Пути в профилях указываются относительно файла сценария (`scenarios/...`).
+
+## Суточное расписание нагрузки (`load_schedule`)
+
+В YAML сценария можно задать расписание по **локальному времени** (час суток 0–23, границы на `:00`):
+
+- либо inline-блок `load_schedule:` с полями `max_load`, опционально `timezone`, `intervals` (ключ — час начала интервала, значение — процент от `max_load` до следующего ключа; сегменты могут переходить через полночь);
+- либо `load_schedule_profile: "includes/....yml"` — в include-файле на корне те же поля (`max_load`, `timezone`, `intervals`), **без** вложенного `load_schedule:`.
+
+Нельзя указывать одновременно `load_schedule` и `load_schedule_profile`. Пример профиля: `scenarios/includes/load-schedule-sbp.yml`, подключение — как в `scenarios/sbp-no-ssl.yml`.
+
+**Целевой TPS** при активном расписании: `max_load × (процент интервала)/100 × (run percent)/100`, затем применяется обычный ramp-up из `RunConfig`.
+
+Флаг **`ignore_load_schedule`** (CLI: `--ignore-load-schedule`, UI: чекбокс «игнорировать расписание» / «Без распис.» в строке executor): при значении `true` расписание **не** применяется, используется только `base_tps × percent/100` как без `load_schedule`.
+
+В ответе `run status` у executor в `Status` есть поле `scenario_has_load_schedule` — в загруженном сценарии есть непустое расписание.
 
 ## Сценарий mq-topic1-request-reply
 
@@ -352,6 +376,10 @@ go run ./cmd/gruzilla-cli templates create --path "new.json.tmpl" --dir "templat
 go run ./cmd/gruzilla-cli templates update --path "new.json.tmpl" --dir "templates" --from-file "C:\temp\new-template.tmpl"
 go run ./cmd/gruzilla-cli templates delete --path "new.json.tmpl" --dir "templates" --yes
 ```
+
+## Логи executor (трафик шагов)
+
+Если процесс `gruzilla-executor` запущен с непустым **`--log-file`**, в этот файл дополнительно пишутся строки о трафике шагов (исходящие/входящие запросы и ответы, с временем и контекстом). Через UI/backend это настраивается в `config-backend.yml`: `cli.executor_logs_enabled` и `cli.executor_log_file` (в шаблоне имени файла можно использовать `{addr}`).
 
 ## Полезные ссылки
 

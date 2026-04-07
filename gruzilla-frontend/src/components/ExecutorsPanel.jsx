@@ -8,6 +8,7 @@ import {
   Button,
   Card,
   CardContent,
+  Checkbox,
   Chip,
   IconButton,
   MenuItem,
@@ -60,6 +61,10 @@ function parseExecutors(data) {
       baseTps: null,
       rampUpSeconds: null,
       steps: null,
+      scenarioHasLoadSchedule: false,
+      ignoreLoadSchedule: false,
+      loadScheduleMaxLoad: null,
+      loadScheduleSummary: null,
     }));
   }
   const lines = Array.isArray(data?.lines) ? data.lines : [];
@@ -84,6 +89,10 @@ function parseExecutors(data) {
         baseTps: null,
         rampUpSeconds: null,
         steps: null,
+        scenarioHasLoadSchedule: false,
+        ignoreLoadSchedule: false,
+        loadScheduleMaxLoad: null,
+        loadScheduleSummary: null,
       };
     })
     .filter(Boolean);
@@ -195,6 +204,7 @@ function mergeStepLatencyHistory(rows, prev, refreshTs) {
   const next = { ...prev };
   const activePids = new Set(rows.map((r) => r.pid));
   for (const row of rows) {
+    if (row.status !== "running") continue;
     if (!Array.isArray(row.steps)) continue;
     for (const st of row.steps) {
       const k = stepLatencyKey(row.pid, st.index);
@@ -221,6 +231,7 @@ function mergeAttemptMetricsHistory(rows, prev, refreshTs) {
   const next = { ...prev };
   const activePids = new Set(rows.map((r) => r.pid));
   for (const row of rows) {
+    if (row.status !== "running") continue;
     const a = row.attemptsCount;
     const s = row.successCount;
     const e = row.errorCount;
@@ -304,6 +315,8 @@ export default function ExecutorsPanel({
   const [percent, setPercent] = useState(100);
   const [baseTps, setBaseTps] = useState(100);
   const [rampUp, setRampUp] = useState(0);
+  /** true = игнорировать load_schedule при старте/обновлении с строки */
+  const [ignoreLoadSchedule, setIgnoreLoadSchedule] = useState(false);
   const [lastResponse, setLastResponse] = useState(null);
   const [loading, setLoading] = useState(false);
   const [paramDrafts, setParamDrafts] = useState({});
@@ -321,13 +334,30 @@ export default function ExecutorsPanel({
     percent: row.percent ?? 100,
     baseTps: row.baseTps ?? 100,
     rampUp: row.rampUpSeconds ?? 0,
+    ignoreLoadSchedule: row.ignoreLoadSchedule === true,
   });
 
+  /** Режим по расписанию: % = 100, TPS-поле = max_load из сценария (из статуса executor). */
   const getDisplayParams = (row) => {
+    let p;
     if (selectedExecutor?.pid === row.pid) {
-      return { percent, baseTps, rampUp };
+      p = { percent, baseTps, rampUp, ignoreLoadSchedule };
+    } else {
+      p = { ...(paramDrafts[row.pid] ?? rowParamDefaults(row)) };
     }
-    return paramDrafts[row.pid] ?? rowParamDefaults(row);
+    const follow = row.scenarioHasLoadSchedule === true && p.ignoreLoadSchedule !== true;
+    const ml = Number(row.loadScheduleMaxLoad);
+    if (follow) {
+      if (Number.isFinite(ml) && ml > 0) {
+        return { percent: 100, baseTps: ml, rampUp: p.rampUp, ignoreLoadSchedule: p.ignoreLoadSchedule };
+      }
+      const fromStatus = Number(row.baseTps);
+      const fallback =
+        Number.isFinite(fromStatus) && fromStatus > 0 ? fromStatus : Number(p.baseTps);
+      const b = Number.isFinite(fallback) && fallback > 0 ? fallback : 100;
+      return { percent: 100, baseTps: b, rampUp: p.rampUp, ignoreLoadSchedule: p.ignoreLoadSchedule };
+    }
+    return p;
   };
 
   const updateRowParams = (row, patch) => {
@@ -335,6 +365,7 @@ export default function ExecutorsPanel({
       if ("percent" in patch) setPercent(patch.percent);
       if ("baseTps" in patch) setBaseTps(patch.baseTps);
       if ("rampUp" in patch) setRampUp(patch.rampUp);
+      if ("ignoreLoadSchedule" in patch) setIgnoreLoadSchedule(patch.ignoreLoadSchedule);
       return;
     }
     setParamDrafts((prev) => {
@@ -345,15 +376,23 @@ export default function ExecutorsPanel({
 
   const syncControlsFromRow = (row) => {
     if (!row) return;
-    if (Number.isFinite(Number(row.percent))) {
-      setPercent(Number(row.percent));
-    }
-    if (Number.isFinite(Number(row.baseTps))) {
-      setBaseTps(Number(row.baseTps));
+    const follow = row.scenarioHasLoadSchedule === true && row.ignoreLoadSchedule !== true;
+    const ml = Number(row.loadScheduleMaxLoad);
+    if (follow && Number.isFinite(ml) && ml > 0) {
+      setPercent(100);
+      setBaseTps(ml);
+    } else {
+      if (Number.isFinite(Number(row.percent))) {
+        setPercent(Number(row.percent));
+      }
+      if (Number.isFinite(Number(row.baseTps))) {
+        setBaseTps(Number(row.baseTps));
+      }
     }
     if (Number.isFinite(Number(row.rampUpSeconds))) {
       setRampUp(Number(row.rampUpSeconds));
     }
+    setIgnoreLoadSchedule(row.ignoreLoadSchedule === true);
   };
 
   const applyChartHistory = useCallback((enrichedRows) => {
@@ -401,6 +440,10 @@ export default function ExecutorsPanel({
             currentTps: null,
             busyWorkers: null,
             steps: null,
+            scenarioHasLoadSchedule: false,
+            ignoreLoadSchedule: false,
+            loadScheduleMaxLoad: null,
+            loadScheduleSummary: null,
           };
         }
         const response = await postApi(
@@ -420,6 +463,10 @@ export default function ExecutorsPanel({
             currentTps: null,
             busyWorkers: null,
             steps: null,
+            scenarioHasLoadSchedule: false,
+            ignoreLoadSchedule: false,
+            loadScheduleMaxLoad: null,
+            loadScheduleSummary: null,
           };
         }
 
@@ -435,6 +482,19 @@ export default function ExecutorsPanel({
         const baseTps = config?.base_tps;
         const rampUpSeconds = config?.ramp_up_seconds;
         const steps = Array.isArray(metrics?.steps) ? metrics.steps : null;
+        const scenarioHasLoadSchedule = data.scenario_has_load_schedule === true;
+        const ignLS = config?.ignore_load_schedule === true;
+        const mlRaw = data.load_schedule_max_load;
+        const loadScheduleMaxLoad =
+          mlRaw !== undefined &&
+          mlRaw !== null &&
+          Number.isFinite(Number(mlRaw)) &&
+          Number(mlRaw) > 0
+            ? Number(mlRaw)
+            : null;
+        const sumRaw = data.load_schedule_summary;
+        const loadScheduleSummary =
+          typeof sumRaw === "string" && sumRaw.trim() !== "" ? sumRaw.trim() : null;
         return {
           pid: row.pid,
           status: running ? "running" : "stopped",
@@ -447,6 +507,10 @@ export default function ExecutorsPanel({
           baseTps: Number.isFinite(Number(baseTps)) ? Number(baseTps) : null,
           rampUpSeconds: Number.isFinite(Number(rampUpSeconds)) ? Number(rampUpSeconds) : null,
           steps,
+          scenarioHasLoadSchedule,
+          ignoreLoadSchedule: ignLS,
+          loadScheduleMaxLoad,
+          loadScheduleSummary,
         };
       }),
     );
@@ -466,6 +530,12 @@ export default function ExecutorsPanel({
         baseTps: patch.baseTps,
         rampUpSeconds: patch.rampUpSeconds,
         steps: patch.steps ?? row.steps ?? null,
+        scenarioHasLoadSchedule: patch.scenarioHasLoadSchedule ?? row.scenarioHasLoadSchedule ?? false,
+        ignoreLoadSchedule: patch.ignoreLoadSchedule ?? row.ignoreLoadSchedule ?? false,
+        loadScheduleMaxLoad:
+          patch.loadScheduleMaxLoad !== undefined ? patch.loadScheduleMaxLoad : row.loadScheduleMaxLoad ?? null,
+        loadScheduleSummary:
+          patch.loadScheduleSummary !== undefined ? patch.loadScheduleSummary : row.loadScheduleSummary ?? null,
       };
     });
   };
@@ -551,7 +621,12 @@ export default function ExecutorsPanel({
 
   const loadParamsForRow = (row) => {
     const p = getDisplayParams(row);
-    return { percent: p.percent, base_tps: p.baseTps, ramp_up_seconds: p.rampUp };
+    return {
+      percent: p.percent,
+      base_tps: p.baseTps,
+      ramp_up_seconds: p.rampUp,
+      ignore_load_schedule: p.ignoreLoadSchedule === true,
+    };
   };
 
   const runActionForRow = async (row, path, body = {}) => {
@@ -565,7 +640,7 @@ export default function ExecutorsPanel({
         { baseUrl },
       );
       setLastResponse(response);
-      if (path === "/api/v1/run/reset-metrics" || path === "/api/v1/run/stop") {
+      if (path === "/api/v1/run/reset-metrics") {
         clearExecutorChartsForPid(row.pid);
       }
       if (path === "/api/v1/run/status") {
@@ -608,7 +683,6 @@ export default function ExecutorsPanel({
           { baseUrl },
         );
         setLastResponse(response);
-        clearExecutorChartsForPid(row.pid);
         await refresh({ silent: true });
       }
     } finally {
@@ -738,7 +812,10 @@ export default function ExecutorsPanel({
                     <TableCell align="right" sx={{ minWidth: 56, width: "7%" }}>
                       Busy Workers
                     </TableCell>
-                    <TableCell align="right" sx={{ minWidth: 200, width: "34%" }}>
+                    <TableCell align="center" sx={{ minWidth: 72, width: "9%" }}>
+                      Расписание
+                    </TableCell>
+                    <TableCell align="right" sx={{ minWidth: 200, width: "25%" }}>
                       Управление
                     </TableCell>
                   </TableRow>
@@ -747,6 +824,8 @@ export default function ExecutorsPanel({
                   {rows.map((row) => {
                     const expanded = selectedExecutor?.pid === row.pid;
                     const rowParams = getDisplayParams(row);
+                    const followScheduleRow =
+                      row.scenarioHasLoadSchedule === true && rowParams.ignoreLoadSchedule !== true;
                     const attemptRunState = attemptMetricsHistory[attemptMetricsKey(row.pid)];
                     const bucketsAttempts = attemptSeriesSlots(attemptRunState, "attempts");
                     const bucketsSuccess = attemptSeriesSlots(attemptRunState, "success");
@@ -802,7 +881,9 @@ export default function ExecutorsPanel({
                               overflowWrap: "anywhere",
                             }}
                           >
-                            {row.scenario}
+                            <Typography variant="body2" component="span">
+                              {row.scenario}
+                            </Typography>
                           </TableCell>
                           <TableCell
                             sx={{
@@ -833,6 +914,30 @@ export default function ExecutorsPanel({
                             {row.busyWorkers ?? "-"}
                           </TableCell>
                           <TableCell
+                            align="center"
+                            onClick={(e) => e.stopPropagation()}
+                            sx={{ verticalAlign: "middle", minWidth: 0, px: 0.5 }}
+                          >
+                            {row.scenarioHasLoadSchedule ? (
+                              <Tooltip title="Включено — нагрузка по load_schedule сценария; выключено — только Base TPS × %">
+                                <Checkbox
+                                  size="small"
+                                  checked={rowParams.ignoreLoadSchedule !== true}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) =>
+                                    updateRowParams(row, {
+                                      ignoreLoadSchedule: !e.target.checked,
+                                    })
+                                  }
+                                />
+                              </Tooltip>
+                            ) : (
+                              <Typography variant="caption" color="text.disabled">
+                                —
+                              </Typography>
+                            )}
+                          </TableCell>
+                          <TableCell
                             align="right"
                             onClick={(e) => e.stopPropagation()}
                             sx={{ verticalAlign: "middle", minWidth: 0 }}
@@ -851,6 +956,7 @@ export default function ExecutorsPanel({
                                   type="number"
                                   label="%"
                                   value={rowParams.percent}
+                                  disabled={loading || followScheduleRow}
                                   onChange={(e) =>
                                     updateRowParams(row, { percent: Number(e.target.value) })
                                   }
@@ -861,6 +967,7 @@ export default function ExecutorsPanel({
                                   type="number"
                                   label="TPS"
                                   value={rowParams.baseTps}
+                                  disabled={loading || followScheduleRow}
                                   onChange={(e) =>
                                     updateRowParams(row, { baseTps: Number(e.target.value) })
                                   }
@@ -931,7 +1038,7 @@ export default function ExecutorsPanel({
                         {expanded && (
                           <TableRow hover={false} selected={false}>
                             <TableCell
-                              colSpan={11}
+                              colSpan={12}
                               sx={{
                                 py: 0,
                                 px: 0,
@@ -941,7 +1048,11 @@ export default function ExecutorsPanel({
                               onClick={(e) => e.stopPropagation()}
                             >
                               <Box sx={{ py: 2, px: 2 }}>
-                                <Stack direction="row" spacing={1} sx={{ mb: 2, flexWrap: "wrap", gap: 1 }}>
+                                <Stack
+                                  direction="row"
+                                  spacing={1}
+                                  sx={{ mb: 2, flexWrap: "wrap", gap: 1, alignItems: "center" }}
+                                >
                                   <Button
                                     size="small"
                                     variant={detailView === "steps" ? "contained" : "outlined"}
@@ -962,6 +1073,25 @@ export default function ExecutorsPanel({
                                   >
                                     График
                                   </Button>
+                                  {row.scenarioHasLoadSchedule && row.loadScheduleSummary ? (
+                                    <Tooltip title={row.loadScheduleSummary}>
+                                      <Typography
+                                        variant="caption"
+                                        color="text.secondary"
+                                        component="span"
+                                        sx={{
+                                          maxWidth: { xs: "100%", sm: 560 },
+                                          display: "inline-block",
+                                          overflow: "hidden",
+                                          textOverflow: "ellipsis",
+                                          whiteSpace: "nowrap",
+                                          verticalAlign: "middle",
+                                        }}
+                                      >
+                                        {row.loadScheduleSummary}
+                                      </Typography>
+                                    </Tooltip>
+                                  ) : null}
                                 </Stack>
 
                                 {detailView === "steps" ? (
@@ -976,6 +1106,10 @@ export default function ExecutorsPanel({
                                           tableLayout: "fixed",
                                           "& .MuiTableCell-root": { whiteSpace: "nowrap" },
                                           "& .MuiTableCell-root.step-col-name": { whiteSpace: "normal", wordBreak: "break-word" },
+                                          "& .MuiTableCell-root.step-col-last-err": {
+                                            whiteSpace: "normal",
+                                            wordBreak: "break-word",
+                                          },
                                         }}
                                       >
                                         <TableHead>
@@ -997,6 +1131,12 @@ export default function ExecutorsPanel({
                                               Ср. за тик, мс
                                             </TableCell>
                                             <TableCell
+                                              className="step-col-last-err"
+                                              sx={{ width: "18%", minWidth: 80, maxWidth: 360 }}
+                                            >
+                                              Последняя ошибка
+                                            </TableCell>
+                                            <TableCell
                                               align="right"
                                               className="step-col-chart"
                                               sx={{
@@ -1011,8 +1151,8 @@ export default function ExecutorsPanel({
                                         </TableHead>
                                         <TableBody>
                                           {row.steps.map((st) => {
-                                            const rawHist = stepLatencyHistory[stepLatencyKey(row.pid, st.index)] || [];
-                                            const sparkBuckets = stepLatencySlotsForChart(rawHist);
+                                            const rawHist = stepLatencyHistory[stepLatencyKey(row.pid, st.index)];
+                                            const sparkBuckets = stepLatencySlotsForChart(rawHist ?? []);
                                             return (
                                               <TableRow key={`${st.index}-${st.name}`}>
                                                 <TableCell sx={{ width: 32, minWidth: 0, px: 0.75 }}>
@@ -1036,6 +1176,37 @@ export default function ExecutorsPanel({
                                                     {st.last_latency_ms ?? 0}
                                                   </Typography>
                                                 </TableCell>
+                                                <TableCell className="step-col-last-err" sx={{ minWidth: 0, maxWidth: 360 }}>
+                                                  {(() => {
+                                                    const msg = String(
+                                                      st.last_step_error ?? st.lastStepError ?? "",
+                                                    ).trim();
+                                                    if (!msg) {
+                                                      return (
+                                                        <Typography variant="body2" color="text.disabled" component="span">
+                                                          —
+                                                        </Typography>
+                                                      );
+                                                    }
+                                                    return (
+                                                      <Tooltip title={msg}>
+                                                        <Typography
+                                                          variant="body2"
+                                                          component="span"
+                                                          color="error"
+                                                          sx={{
+                                                            display: "-webkit-box",
+                                                            WebkitLineClamp: 3,
+                                                            WebkitBoxOrient: "vertical",
+                                                            overflow: "hidden",
+                                                          }}
+                                                        >
+                                                          {msg}
+                                                        </Typography>
+                                                      </Tooltip>
+                                                    );
+                                                  })()}
+                                                </TableCell>
                                                 <TableCell
                                                   align="right"
                                                   className="step-col-chart"
@@ -1048,15 +1219,8 @@ export default function ExecutorsPanel({
                                                     boxSizing: "border-box",
                                                   }}
                                                 >
-                                                  <Tooltip title="Задержка за тик (мс). 30 фиксированных точек — последние 30 опросов: сдвиг влево, справа всегда свежее значение. Пороги 500/1000 мс на линейке.">
-                                                    <Box
-                                                      sx={{
-                                                        display: "block",
-                                                        width: "100%",
-                                                        maxWidth: "100%",
-                                                        minWidth: 0,
-                                                      }}
-                                                    >
+                                                  <Tooltip title="Задержка за тик (мс). 30 фиксированных точек — последние 30 опросов: сдвиг влево, справа свежее значение. Пороги 500/1000 мс.">
+                                                    <Box sx={{ width: "100%", maxWidth: "100%", minWidth: 0 }}>
                                                       <LatencySparkline buckets={sparkBuckets} width="100%" />
                                                     </Box>
                                                   </Tooltip>
