@@ -34,7 +34,7 @@ type Scenario struct {
 // Поля сгруппированы по типам шагов (rest/kafka/db/mq/tcp), но лежат в одной
 // структуре для упрощения парсинга YAML и сериализации в API.
 type Step struct {
-	Type     string `yaml:"type" json:"type"` // rest|kafka|db|mq|tcp
+	Type     string `yaml:"type" json:"type"` // rest|kafka|db|mq|tcp|tcp_iso8583_xml
 	Name     string `yaml:"name,omitempty" json:"name,omitempty"`
 	Method   string `yaml:"method,omitempty" json:"method,omitempty"`
 	URL      string `yaml:"url,omitempty" json:"url,omitempty"`
@@ -109,10 +109,11 @@ type Step struct {
 	// TCPExtract: сырой ответ — срез байт в переменную; значение "offset:length" или "offset:length:hex"
 	TCPExtract map[string]string `yaml:"tcp_extract,omitempty" json:"tcp_extract,omitempty"`
 	// ISO 8583 (github.com/moov-io/iso8583): либо tcp_iso8583_fields вместо tcp_payload*, либо только unpack ответа.
-	TCPISO8583Spec    string            `yaml:"tcp_iso8583_spec,omitempty" json:"tcp_iso8583_spec,omitempty"`       // spec87ascii | spec87ascii_binmap | spec87hex | spec87track2
-	TCPISO8583Fields  map[string]string `yaml:"tcp_iso8583_fields,omitempty" json:"tcp_iso8583_fields,omitempty"`   // номер поля → значение ({{var}}, {{__now:...}})
-	TCPISO8583Extract map[string]string `yaml:"tcp_iso8583_extract,omitempty" json:"tcp_iso8583_extract,omitempty"` // имя переменной → номер поля ответа
-	TCPISO8583Assert  map[string]string `yaml:"tcp_iso8583_assert,omitempty" json:"tcp_iso8583_assert,omitempty"`   // номер поля → ожидаемое значение
+	TCPISO8583Spec    string            `yaml:"tcp_iso8583_spec,omitempty" json:"tcp_iso8583_spec,omitempty"`         // spec87ascii | spec87ascii_binmap | spec87hex | spec87track2
+	TCPISO8583SpecXML string            `yaml:"tcp_iso8583_spec_xml,omitempty" json:"tcp_iso8583_spec_xml,omitempty"` // путь к XML-описанию протокола (например BPC8583POS.xml)
+	TCPISO8583Fields  map[string]string `yaml:"tcp_iso8583_fields,omitempty" json:"tcp_iso8583_fields,omitempty"`     // номер поля → значение ({{var}}, {{__now:...}})
+	TCPISO8583Extract map[string]string `yaml:"tcp_iso8583_extract,omitempty" json:"tcp_iso8583_extract,omitempty"`   // имя переменной → номер поля ответа
+	TCPISO8583Assert  map[string]string `yaml:"tcp_iso8583_assert,omitempty" json:"tcp_iso8583_assert,omitempty"`     // номер поля → ожидаемое значение
 	TCPTLS            bool              `yaml:"tcp_tls,omitempty" json:"tcp_tls,omitempty"`
 	TCPTLSInsecure    bool              `yaml:"tcp_tls_insecure,omitempty" json:"tcp_tls_insecure,omitempty"`
 	TCPTLSServerName  string            `yaml:"tcp_tls_server_name,omitempty" json:"tcp_tls_server_name,omitempty"`
@@ -404,20 +405,23 @@ func Validate(sc Scenario) error {
 				return fmt.Errorf("step[%d].db_query is required for db", i)
 			}
 		case "mq":
-		case "tcp":
+		case "tcp", "tcp_iso8583_xml":
 			if st.TCPAddr == "" {
-				return fmt.Errorf("step[%d].tcp_addr is required for tcp", i)
+				return fmt.Errorf("step[%d].tcp_addr is required for %s", i, st.Type)
 			}
 			iso := len(st.TCPISO8583Fields) > 0
 			raw := strings.TrimSpace(st.TCPPayload) != "" || strings.TrimSpace(st.TCPPayloadHex) != ""
 			if iso && raw {
-				return fmt.Errorf("step[%d] tcp: either tcp_iso8583_fields or tcp_payload/tcp_payload_hex, not both", i)
+				return fmt.Errorf("step[%d] %s: either tcp_iso8583_fields or tcp_payload/tcp_payload_hex, not both", i, st.Type)
 			}
 			if !iso && !raw {
-				return fmt.Errorf("step[%d] tcp: set tcp_iso8583_fields or tcp_payload or tcp_payload_hex", i)
+				return fmt.Errorf("step[%d] %s: set tcp_iso8583_fields or tcp_payload or tcp_payload_hex", i, st.Type)
+			}
+			if st.Type == "tcp_iso8583_xml" && strings.TrimSpace(st.TCPISO8583SpecXML) == "" {
+				return fmt.Errorf("step[%d] tcp_iso8583_xml: tcp_iso8583_spec_xml is required", i)
 			}
 		default:
-			return fmt.Errorf("step[%d].type must be one of: rest, kafka, db, mq, tcp", i)
+			return fmt.Errorf("step[%d].type must be one of: rest, kafka, db, mq, tcp, tcp_iso8583_xml", i)
 		}
 	}
 

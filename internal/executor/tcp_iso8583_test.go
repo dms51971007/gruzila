@@ -2,6 +2,8 @@ package executor
 
 import (
 	"encoding/hex"
+	"os"
+	"path/filepath"
 	"testing"
 
 	iso8583lib "github.com/moov-io/iso8583"
@@ -120,5 +122,42 @@ func TestISO8583UnpackMTIField0(t *testing.T) {
 	}
 	if mti != "0210" {
 		t.Fatalf("GetString(0): got %q", mti)
+	}
+}
+
+func TestBuildPayloadFromISO8583SpecXML(t *testing.T) {
+	dir := t.TempDir()
+	xmlPath := filepath.Join(dir, "BPC8583POS.xml")
+	xmlBody := `<Protocol id="6" name="BPC8583POS" type="ISO8583">
+	<Field name="MTI" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="4"></Field>
+	<Field name="BITMAP" fldType="ISOBITMAP" encode="BCH" format="*" lenType="FIX" len="8">
+		<Field id="3" name="F03" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="6"></Field>
+	</Field>
+</Protocol>`
+	if err := os.WriteFile(xmlPath, []byte(xmlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := scenario.Step{
+		TCPISO8583SpecXML: xmlPath,
+		TCPISO8583Fields: map[string]string{
+			"0": "0200",
+			"3": "000000",
+		},
+	}
+	b, spec, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec == nil {
+		t.Fatal("nil spec")
+	}
+	if string(b[:4]) != "0200" {
+		t.Fatalf("MTI: got %q", b[:4])
+	}
+	if len(b) != 4+8+6 {
+		t.Fatalf("len want %d (mti+8byte bitmap+fld3), got %d", 4+8+6, len(b))
+	}
+	if string(b[12:]) != "000000" {
+		t.Fatalf("field 3 on wire: %q", b[12:])
 	}
 }

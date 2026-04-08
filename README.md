@@ -377,6 +377,35 @@ go run ./cmd/gruzilla-cli templates update --path "new.json.tmpl" --dir "templat
 go run ./cmd/gruzilla-cli templates delete --path "new.json.tmpl" --dir "templates" --yes
 ```
 
+## TCP ISO8583 по XML-спеке
+
+Добавлен отдельный вид шага сценария: `type: tcp_iso8583_xml`.
+
+Назначение: отправка ISO8583-сообщений по формату из внешнего XML-описания протокола (например `BPC8583POS.xml`).
+
+Ключевые поля шага:
+
+- `tcp_iso8583_spec_xml` — путь к XML-файлу спецификации;
+- `tcp_iso8583_fields` — карта `номер_поля -> значение`;
+- `tcp_length_prefix` — префикс длины TCP кадра (`4ascii`, `2be`, и т.д.).
+
+Минимальный пример:
+
+```yaml
+name: "tcp-iso8583-xml-bpc"
+steps:
+  - type: tcp_iso8583_xml
+    tcp_addr: "127.0.0.1:9000"
+    tcp_length_prefix: "4ascii"
+    tcp_iso8583_spec_xml: "c:\\projects\\BPC8583POS.xml"
+    tcp_iso8583_fields:
+      "0": "0200"
+      "3": "000000"
+      "11": "{{__randDigits:6}}"
+```
+
+Готовый полный пример в репозитории: `scenarios/tcp-iso8583-xml-bpc.yml`.
+
 ## Логи executor (трафик шагов)
 
 Если процесс `gruzilla-executor` запущен с непустым **`--log-file`**, в этот файл дополнительно пишутся строки о трафике шагов (исходящие/входящие запросы и ответы, с временем и контекстом). Через UI/backend это настраивается в `config-backend.yml`: `cli.executor_logs_enabled` и `cli.executor_log_file` (в шаблоне имени файла можно использовать `{addr}`).

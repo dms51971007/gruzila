@@ -1,11 +1,16 @@
 package executor
 
 import (
+	"encoding/xml"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	iso8583lib "github.com/moov-io/iso8583"
 	"github.com/moov-io/iso8583/encoding"
@@ -58,12 +63,239 @@ func iso8583MessageSpecByName(name string) (*iso8583lib.MessageSpec, error) {
 	}
 }
 
-func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte, *iso8583lib.MessageSpec, error) {
+type xmlSpecCacheEntry struct {
+	modTime time.Time
+	size    int64
+	spec    *iso8583lib.MessageSpec
+}
+
+var iso8583XMLSpecCache sync.Map // key: absolute path, value: xmlSpecCacheEntry
+
+type xmlProtocolSpec struct {
+	Name   string         `xml:"name,attr"`
+	Fields []xmlFieldSpec `xml:"Field"`
+}
+
+type xmlFieldSpec struct {
+	ID      string         `xml:"id,attr"`
+	Name    string         `xml:"name,attr"`
+	Desc    string         `xml:"desc,attr"`
+	FldType string         `xml:"fldType,attr"`
+	Encode  string         `xml:"encode,attr"`
+	Format  string         `xml:"format,attr"`
+	LenType string         `xml:"lenType,attr"`
+	Len     string         `xml:"len,attr"`
+	Range   xmlLengthRange `xml:"LengthRange"`
+	Fields  []xmlFieldSpec `xml:"Field"`
+}
+
+type xmlLengthRange struct {
+	Min string `xml:"minLength,attr"`
+	Max string `xml:"maxLength,attr"`
+}
+
+func resolveISO8583Spec(step scenario.Step, vars map[string]string) (*iso8583lib.MessageSpec, error) {
+	xmlPath := strings.TrimSpace(interpolate(vars, step.TCPISO8583SpecXML))
+	if xmlPath != "" {
+		return loadISO8583SpecFromXML(xmlPath)
+	}
 	specName := strings.TrimSpace(step.TCPISO8583Spec)
 	if specName == "" {
 		specName = "spec87ascii"
 	}
-	sp, err := iso8583MessageSpecByName(specName)
+	return iso8583MessageSpecByName(specName)
+}
+
+func loadISO8583SpecFromXML(path string) (*iso8583lib.MessageSpec, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("tcp_iso8583_spec_xml: resolve %q: %w", path, err)
+	}
+	st, err := os.Stat(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("tcp_iso8583_spec_xml: stat %q: %w", absPath, err)
+	}
+	if cached, ok := iso8583XMLSpecCache.Load(absPath); ok {
+		entry, ok := cached.(xmlSpecCacheEntry)
+		if ok && entry.size == st.Size() && entry.modTime.Equal(st.ModTime()) && entry.spec != nil {
+			return entry.spec, nil
+		}
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("tcp_iso8583_spec_xml: read %q: %w", absPath, err)
+	}
+	var proto xmlProtocolSpec
+	if err := xml.Unmarshal(data, &proto); err != nil {
+		// В реальных выгрузках встречаются "грязные" XML (битые атрибуты, неэкранированный '<'
+		// внутри desc и т.п.). Пробуем мягкую санацию и парсим повторно.
+		clean := sanitizeISO8583XML(data)
+		if err2 := xml.Unmarshal(clean, &proto); err2 != nil {
+			return nil, fmt.Errorf("tcp_iso8583_spec_xml: parse %q: %w", absPath, err2)
+		}
+	}
+	sp, err := buildMessageSpecFromXMLProtocol(proto)
+	if err != nil {
+		return nil, fmt.Errorf("tcp_iso8583_spec_xml: %w", err)
+	}
+	iso8583XMLSpecCache.Store(absPath, xmlSpecCacheEntry{
+		modTime: st.ModTime(),
+		size:    st.Size(),
+		spec:    sp,
+	})
+	return sp, nil
+}
+
+func sanitizeISO8583XML(data []byte) []byte {
+	s := string(data)
+	// Частый дефект: слитный атрибут вместо имени тега + атрибута.
+	s = strings.ReplaceAll(s, "<ProtocolFieldPaddingside=", "<ProtocolFieldPadding side=")
+	// Невалидный XML: необработанный '<' внутри значений атрибутов (обычно desc="... < ...").
+	s = escapeLessThanInQuotedAttributes(s)
+	// На всякий случай удаляем некорректные UTF-8 последовательности.
+	if !utf8.ValidString(s) {
+		out := make([]rune, 0, len(s))
+		for _, r := range s {
+			if r == utf8.RuneError {
+				continue
+			}
+			out = append(out, r)
+		}
+		s = string(out)
+	}
+	return []byte(s)
+}
+
+func escapeLessThanInQuotedAttributes(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 64)
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '"' {
+			inQuote = !inQuote
+			b.WriteByte(ch)
+			continue
+		}
+		if inQuote && ch == '<' {
+			b.WriteString("&lt;")
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
+}
+
+func buildMessageSpecFromXMLProtocol(proto xmlProtocolSpec) (*iso8583lib.MessageSpec, error) {
+	var bitmap *xmlFieldSpec
+	for i := range proto.Fields {
+		f := &proto.Fields[i]
+		if strings.EqualFold(strings.TrimSpace(f.Name), "BITMAP") {
+			bitmap = f
+			break
+		}
+	}
+	if bitmap == nil {
+		return nil, fmt.Errorf("xml protocol has no BITMAP field")
+	}
+	fields := make(map[int]field.Field)
+	fields[0] = field.NewString(&field.Spec{
+		Length:      4,
+		Description: "MTI",
+		Enc:         encoding.ASCII,
+		Pref:        prefix.ASCII.Fixed,
+	})
+	fields[1] = field.NewBitmap(&field.Spec{
+		Description: "Bitmap",
+		Enc:         encoding.Binary,
+		Pref:        prefix.Binary.Fixed,
+	})
+	for _, xf := range bitmap.Fields {
+		id, err := strconv.Atoi(strings.TrimSpace(xf.ID))
+		if err != nil || id <= 1 {
+			continue
+		}
+		ff, err := makeFieldFromXML(xf)
+		if err != nil {
+			return nil, fmt.Errorf("field id=%d name=%q: %w", id, xf.Name, err)
+		}
+		fields[id] = ff
+	}
+	name := strings.TrimSpace(proto.Name)
+	if name == "" {
+		name = "ISO8583 from XML"
+	}
+	return &iso8583lib.MessageSpec{Name: name, Fields: fields}, nil
+}
+
+func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
+	rawLen := strings.TrimSpace(xf.Len)
+	if rawLen == "" {
+		// У некоторых выгрузок len отсутствует, но указан maxLength в LengthRange.
+		rawLen = strings.TrimSpace(xf.Range.Max)
+	}
+	length, err := strconv.Atoi(rawLen)
+	if err != nil || length < 0 {
+		return nil, fmt.Errorf("invalid len %q", xf.Len)
+	}
+	enc := xmlEncodeToMoov(strings.TrimSpace(xf.Encode))
+	pref, err := xmlLenTypeToMoovPrefix(strings.TrimSpace(xf.LenType), enc)
+	if err != nil {
+		return nil, err
+	}
+	spec := &field.Spec{
+		Length:      length,
+		Description: strings.TrimSpace(xf.Desc),
+		Enc:         enc,
+		Pref:        pref,
+	}
+	format := strings.ToLower(strings.TrimSpace(xf.Format))
+	switch {
+	case strings.HasPrefix(format, "b"), strings.EqualFold(strings.TrimSpace(xf.Encode), "BCH"), strings.EqualFold(strings.TrimSpace(xf.Encode), "BCD"):
+		return field.NewBinary(spec), nil
+	default:
+		// В runtime мы подаем значения как строки из сценария; String сохраняет ведущие нули
+		// (например F03=000000), тогда как Numeric может схлопывать их.
+		return field.NewString(spec), nil
+	}
+}
+
+func xmlEncodeToMoov(enc string) encoding.Encoder {
+	switch strings.ToUpper(strings.TrimSpace(enc)) {
+	case "BCH", "BCD":
+		return encoding.Binary
+	case "ASCII", "":
+		return encoding.ASCII
+	default:
+		return encoding.ASCII
+	}
+}
+
+func xmlLenTypeToMoovPrefix(lenType string, enc encoding.Encoder) (prefix.Prefixer, error) {
+	var p prefix.Prefixers
+	if enc == encoding.Binary {
+		p = prefix.Binary
+	} else {
+		p = prefix.ASCII
+	}
+	switch strings.ToUpper(strings.TrimSpace(lenType)) {
+	case "FIX", "":
+		return p.Fixed, nil
+	case "LVAR":
+		return p.L, nil
+	case "LLVAR":
+		return p.LL, nil
+	case "LLLVAR":
+		return p.LLL, nil
+	case "LLLLVAR":
+		return p.LLLL, nil
+	default:
+		return nil, fmt.Errorf("unsupported lenType %q", lenType)
+	}
+}
+
+func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte, *iso8583lib.MessageSpec, error) {
+	sp, err := resolveISO8583Spec(step, vars)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -106,6 +338,9 @@ func tcpResponseISO8583Spec(step scenario.Step, buildSpec *iso8583lib.MessageSpe
 		return buildSpec, nil
 	}
 	name := strings.TrimSpace(step.TCPISO8583Spec)
+	if strings.TrimSpace(step.TCPISO8583SpecXML) != "" {
+		return resolveISO8583Spec(step, nil)
+	}
 	if name == "" {
 		name = "spec87ascii"
 	}

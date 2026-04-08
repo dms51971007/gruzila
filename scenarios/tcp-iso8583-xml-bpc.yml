@@ -1,0 +1,29 @@
+# Отдельный тип шага: tcp_iso8583_xml
+# Сообщение собирается по XML-спецификации (BPC8583POS.xml).
+
+name: "tcp-iso8583-xml-bpc"
+description: "TCP ISO8583 send by XML spec (BPC8583POS)"
+steps:
+  - type: tcp_iso8583_xml
+    name: "iso-0200-bpc-xml"
+    tcp_addr: "127.0.0.1:9000"
+    tcp_length_prefix: "4ascii"
+
+    # Абсолютный или относительный путь к XML-описанию протокола.
+    tcp_iso8583_spec_xml: "c:\\projects\\BPC8583POS.xml"
+
+    # Поля ISO8583 для pack.
+    tcp_iso8583_fields:
+      "0": "0200"
+      "3": "000000"
+      "7": "{{__now:0102150405}}"
+      "11": "{{__randDigits:6}}"
+
+    tcp_read_timeout_ms: 30000
+    tcp_read_max_bytes: 65536
+    tcp_iso8583_extract:
+      rc: "39"
+      rsp_mti: "0"
+    tcp_iso8583_assert:
+      "0": "0210"
+      "39": "00"

@@ -804,6 +804,9 @@ func (r *runner) executeStep(step scenario.Step, vars map[string]string) error {
 		return r.executeMQ(step, vars)
 	case "tcp":
 		return r.executeTCP(step, vars)
+	case "tcp_iso8583_xml":
+		// Отдельный "вид" сценария для ISO8583 по XML-спецификации.
+		return r.executeTCP(step, vars)
 	default:
 		return fmt.Errorf("unsupported step type: %s", step.Type)
 	}
