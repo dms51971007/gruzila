@@ -1,11 +1,12 @@
 package executor
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	stdsort "sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/moov-io/iso8583/encoding"
 	"github.com/moov-io/iso8583/field"
 	"github.com/moov-io/iso8583/prefix"
+	isoSort "github.com/moov-io/iso8583/sort"
 	"github.com/moov-io/iso8583/specs"
 
 	"gruzilla/internal/scenario"
@@ -77,16 +79,19 @@ type xmlProtocolSpec struct {
 }
 
 type xmlFieldSpec struct {
-	ID      string         `xml:"id,attr"`
-	Name    string         `xml:"name,attr"`
-	Desc    string         `xml:"desc,attr"`
-	FldType string         `xml:"fldType,attr"`
-	Encode  string         `xml:"encode,attr"`
-	Format  string         `xml:"format,attr"`
-	LenType string         `xml:"lenType,attr"`
-	Len     string         `xml:"len,attr"`
-	Range   xmlLengthRange `xml:"LengthRange"`
-	Fields  []xmlFieldSpec `xml:"Field"`
+	ID         string         `xml:"id,attr"`
+	Name       string         `xml:"name,attr"`
+	Tag        string         `xml:"tag,attr"`
+	Desc       string         `xml:"desc,attr"`
+	FldType    string         `xml:"fldType,attr"`
+	Encode     string         `xml:"encode,attr"`
+	Format     string         `xml:"format,attr"`
+	LenType    string         `xml:"lenType,attr"`
+	Len        string         `xml:"len,attr"`
+	TagType    string         `xml:"tagType,attr"`
+	TagTypeLen string         `xml:"tagTypeLen,attr"`
+	Range      xmlLengthRange `xml:"LengthRange"`
+	Fields     []xmlFieldSpec `xml:"Field"`
 }
 
 type xmlLengthRange struct {
@@ -229,6 +234,9 @@ func buildMessageSpecFromXMLProtocol(proto xmlProtocolSpec) (*iso8583lib.Message
 }
 
 func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
+	if strings.EqualFold(strings.TrimSpace(xf.FldType), "TLV") && len(xf.Fields) > 0 {
+		return makeTLVFieldFromXML(xf)
+	}
 	rawLen := strings.TrimSpace(xf.Len)
 	if rawLen == "" {
 		// У некоторых выгрузок len отсутствует, но указан maxLength в LengthRange.
@@ -258,6 +266,61 @@ func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 		// (например F03=000000), тогда как Numeric может схлопывать их.
 		return field.NewString(spec), nil
 	}
+}
+
+func makeTLVFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
+	rawLen := strings.TrimSpace(xf.Len)
+	if rawLen == "" {
+		rawLen = strings.TrimSpace(xf.Range.Max)
+	}
+	length, err := strconv.Atoi(rawLen)
+	if err != nil || length < 0 {
+		return nil, fmt.Errorf("invalid len %q", xf.Len)
+	}
+	enc := xmlEncodeToMoov(strings.TrimSpace(xf.Encode))
+	pref, err := xmlLenTypeToMoovPrefix(strings.TrimSpace(xf.LenType), enc)
+	if err != nil {
+		return nil, err
+	}
+
+	tagLen := 0
+	if strings.TrimSpace(xf.TagTypeLen) != "" {
+		tagLen, _ = strconv.Atoi(strings.TrimSpace(xf.TagTypeLen))
+	}
+	tagEnc := xmlEncodeToMoov(strings.TrimSpace(xf.TagType))
+	if tagEnc == encoding.Binary && strings.EqualFold(strings.TrimSpace(xf.TagType), "ASCII") {
+		tagEnc = encoding.ASCII
+	}
+	if tagLen <= 0 {
+		tagLen = 3
+	}
+
+	sub := make(map[string]field.Field, len(xf.Fields))
+	for _, sf := range xf.Fields {
+		key := strings.TrimSpace(sf.Tag)
+		if key == "" {
+			key = strings.TrimSpace(sf.Name)
+		}
+		if key == "" {
+			continue
+		}
+		ff, err := makeFieldFromXML(sf)
+		if err != nil {
+			return nil, fmt.Errorf("subfield %q: %w", key, err)
+		}
+		sub[key] = ff
+	}
+	return field.NewComposite(&field.Spec{
+		Length:      length,
+		Description: strings.TrimSpace(xf.Desc),
+		Pref:        pref,
+		Tag: &field.TagSpec{
+			Length: tagLen,
+			Enc:    tagEnc,
+			Sort:   isoSort.StringsByInt,
+		},
+		Subfields: sub,
+	}), nil
 }
 
 func xmlEncodeToMoov(enc string) encoding.Encoder {
@@ -312,11 +375,23 @@ func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte
 		}
 		rows = append(rows, fieldRow{id: fid, tpl: tpl})
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	stdsort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
 	for _, row := range rows {
 		val, err := expandStepPlaceholders(interpolate(vars, row.tpl))
 		if err != nil {
 			return nil, nil, fmt.Errorf("tcp_iso8583_fields[%d]: %w", row.id, err)
+		}
+		if strings.HasPrefix(strings.TrimSpace(val), "{") {
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(val), &obj); err == nil && len(obj) > 0 {
+				for k, v := range obj {
+					path := fmt.Sprintf("%d.%s", row.id, strings.TrimSpace(k))
+					if err := msg.MarshalPath(path, v); err != nil {
+						return nil, nil, fmt.Errorf("iso8583 field %d path %s: %w", row.id, path, err)
+					}
+				}
+				continue
+			}
 		}
 		if err := msg.Field(row.id, val); err != nil {
 			return nil, nil, fmt.Errorf("iso8583 field %d: %w", row.id, err)

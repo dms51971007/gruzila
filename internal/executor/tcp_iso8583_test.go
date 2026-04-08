@@ -161,3 +161,39 @@ func TestBuildPayloadFromISO8583SpecXML(t *testing.T) {
 		t.Fatalf("field 3 on wire: %q", b[12:])
 	}
 }
+
+func TestBuildPayloadFromISO8583SpecXMLTLVField48(t *testing.T) {
+	dir := t.TempDir()
+	xmlPath := filepath.Join(dir, "BPC8583POS.xml")
+	xmlBody := `<Protocol id="6" name="BPC8583POS" type="ISO8583">
+	<Field name="MTI" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="4"></Field>
+	<Field name="BITMAP" fldType="ISOBITMAP" encode="BCH" format="*" lenType="FIX" len="8">
+		<Field id="3" name="F03" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="6"></Field>
+		<Field id="48" name="F48" fldType="TLV" encode="ASCII" format="ans" lenType="LLLVAR" len="999" tagType="ASCII" tagTypeLen="3">
+			<Field name="F48.001" tag="001" fldType="GENERIC" encode="ASCII" format="ans" lenType="LLLVAR" len="255"></Field>
+		</Field>
+	</Field>
+</Protocol>`
+	if err := os.WriteFile(xmlPath, []byte(xmlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := scenario.Step{
+		TCPISO8583SpecXML: xmlPath,
+		TCPISO8583Fields: map[string]string{
+			"0":  "0200",
+			"3":  "000000",
+			"48": `{"001":"ABC"}`,
+		},
+	}
+	b, spec, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec == nil || len(b) == 0 {
+		t.Fatal("expected packed message with xml tlv spec")
+	}
+	msg := iso8583lib.NewMessage(spec)
+	if err := msg.Unpack(b); err != nil {
+		t.Fatal(err)
+	}
+}
