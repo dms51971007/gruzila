@@ -331,9 +331,9 @@ func makeTLVFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 			return nil, fmt.Errorf("subfield %q: %w", key, err)
 		}
 		if isBerTLVTag {
-			// Для BER-TLV длина каждого тега кодируется по BER правилам (prefix.BerTLV),
-			// поэтому фиксированные/LLL префиксы из XML для subfield здесь не применимы.
-			ff = wrapFieldWithPrefix(ff, prefix.BerTLV)
+			// Для BER-TLV длина каждого тега кодируется по BER правилам (prefix.BerTLV).
+			// Значения EMV-тегов обычно передаются как hex и должны уходить в бинарном виде.
+			ff = normalizeBerTLVSubfield(ff)
 		}
 		sub[key] = ff
 	}
@@ -374,6 +374,24 @@ func wrapFieldWithPrefix(f field.Field, p prefix.Prefixer) field.Field {
 		return field.NewComposite(&copied)
 	default:
 		return f
+	}
+}
+
+func normalizeBerTLVSubfield(f field.Field) field.Field {
+	spec := f.Spec()
+	if spec == nil {
+		return f
+	}
+	copied := *spec
+	copied.Pref = prefix.BerTLV
+	switch f.(type) {
+	case *field.Composite:
+		return field.NewComposite(&copied)
+	default:
+		// В BER-TLV интерпретируем входные строковые значения как hex-строки,
+		// чтобы на wire уходили бинарные байты, а не ASCII-символы.
+		copied.Enc = encoding.Binary
+		return field.NewHex(&copied)
 	}
 }
 
@@ -440,6 +458,7 @@ func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte
 			if err := json.Unmarshal([]byte(val), &obj); err == nil && len(obj) > 0 {
 				for k, v := range obj {
 					path := fmt.Sprintf("%d.%s", row.id, strings.TrimSpace(k))
+					v = normalizeISO8583PathValue(sp, path, v)
 					if err := marshalISO8583PathValue(msg, path, v); err != nil {
 						return nil, nil, fmt.Errorf("iso8583 field %d path %s: %w", row.id, path, err)
 					}
@@ -473,6 +492,33 @@ func marshalISO8583PathValue(msg *iso8583lib.Message, path string, v any) error 
 		return msg.MarshalPath(path, "0"+trimmed)
 	}
 	return nil
+}
+
+func normalizeISO8583PathValue(sp *iso8583lib.MessageSpec, path string, v any) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	parts := strings.SplitN(path, ".", 2)
+	if len(parts) != 2 {
+		return v
+	}
+	fid, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return v
+	}
+	parent, ok := sp.Fields[fid].(*field.Composite)
+	if !ok || parent.Spec() == nil {
+		return v
+	}
+	sub := parent.Spec().Subfields[strings.TrimSpace(parts[1])]
+	if sub == nil {
+		return v
+	}
+	if _, isHex := sub.(*field.Hex); isHex && isOddLengthHex(strings.TrimSpace(s)) {
+		return "0" + strings.TrimSpace(s)
+	}
+	return v
 }
 
 func isOddLengthHex(s string) bool {

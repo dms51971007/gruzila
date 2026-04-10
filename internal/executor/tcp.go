@@ -79,6 +79,8 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 	if err != nil {
 		return err
 	}
+	r.logTCPHexDump("tcp payload (pre-frame)", "send", payload)
+	r.logTCPHexDump(fmt.Sprintf("tcp frame (prefix=%s)", valueOrDefault(prefix, "none")), "send", frame)
 
 	dialMS := step.TCPDialTimeoutMS
 	if dialMS <= 0 {
@@ -141,6 +143,24 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 	respHex := hex.EncodeToString(resp)
 	r.logTraffic(tcpSrc, "recv", respHex)
 	return r.tcpHandleResponse(step, vars, resp, respHex, isoBuildSpec)
+}
+
+func (r *runner) logTCPHexDump(label, direction string, data []byte) {
+	if r == nil {
+		return
+	}
+	if len(data) == 0 {
+		r.logTraffic(label, direction, "<empty>")
+		return
+	}
+	r.logTraffic(label, direction, fmt.Sprintf("%s (%d bytes):\n%s", label, len(data), hex.Dump(data)))
+}
+
+func valueOrDefault(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }
 
 func (r *runner) tcpHandleResponse(step scenario.Step, vars map[string]string, resp []byte, respHex string, isoBuildSpec *iso8583lib.MessageSpec) error {

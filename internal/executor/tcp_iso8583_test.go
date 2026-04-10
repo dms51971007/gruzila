@@ -244,6 +244,9 @@ func TestBuildPayloadFromISO8583SpecXMLBerTLVField55(t *testing.T) {
 		if sub.Spec().Pref != prefix.BerTLV {
 			t.Fatalf("field 55 subfield %s prefix must be BerTLV", tag)
 		}
+		if _, ok := sub.(*field.Hex); !ok {
+			t.Fatalf("field 55 subfield %s must be hex in BerTLV mode, got %T", tag, sub)
+		}
 	}
 }
 
