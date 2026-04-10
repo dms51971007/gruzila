@@ -226,6 +226,22 @@ func buildMessageSpecFromXMLProtocol(proto xmlProtocolSpec) (*iso8583lib.Message
 		}
 		fields[id] = ff
 	}
+	// Некоторые выгрузки описывают дополнительные поля (например 65+) вне BITMAP.
+	// Подхватываем их тоже, если это валидные ISO-поля.
+	for _, xf := range proto.Fields {
+		id, err := strconv.Atoi(strings.TrimSpace(xf.ID))
+		if err != nil || id <= 1 {
+			continue
+		}
+		if _, exists := fields[id]; exists {
+			continue
+		}
+		ff, err := makeFieldFromXML(xf)
+		if err != nil {
+			return nil, fmt.Errorf("field id=%d name=%q: %w", id, xf.Name, err)
+		}
+		fields[id] = ff
+	}
 	name := strings.TrimSpace(proto.Name)
 	if name == "" {
 		name = "ISO8583 from XML"
@@ -287,11 +303,17 @@ func makeTLVFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 	if strings.TrimSpace(xf.TagTypeLen) != "" {
 		tagLen, _ = strconv.Atoi(strings.TrimSpace(xf.TagTypeLen))
 	}
-	tagEnc := xmlEncodeToMoov(strings.TrimSpace(xf.TagType))
-	if tagEnc == encoding.Binary && strings.EqualFold(strings.TrimSpace(xf.TagType), "ASCII") {
+	tagType := strings.TrimSpace(xf.TagType)
+	tagEnc := xmlEncodeToMoov(tagType)
+	if tagEnc == encoding.Binary && strings.EqualFold(tagType, "ASCII") {
 		tagEnc = encoding.ASCII
 	}
-	if tagLen <= 0 {
+	isBerTLVTag := strings.EqualFold(tagType, "BerTLVTag")
+	if isBerTLVTag {
+		tagEnc = encoding.BerTLVTag
+		tagLen = 0
+	}
+	if tagLen <= 0 && !isBerTLVTag {
 		tagLen = 3
 	}
 
@@ -308,7 +330,16 @@ func makeTLVFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 		if err != nil {
 			return nil, fmt.Errorf("subfield %q: %w", key, err)
 		}
+		if isBerTLVTag {
+			// Для BER-TLV длина каждого тега кодируется по BER правилам (prefix.BerTLV),
+			// поэтому фиксированные/LLL префиксы из XML для subfield здесь не применимы.
+			ff = wrapFieldWithPrefix(ff, prefix.BerTLV)
+		}
 		sub[key] = ff
+	}
+	tagSort := isoSort.StringsByInt
+	if isBerTLVTag {
+		tagSort = isoSort.StringsByHex
 	}
 	return field.NewComposite(&field.Spec{
 		Length:      length,
@@ -317,10 +348,33 @@ func makeTLVFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 		Tag: &field.TagSpec{
 			Length: tagLen,
 			Enc:    tagEnc,
-			Sort:   isoSort.StringsByInt,
+			Sort:   tagSort,
 		},
 		Subfields: sub,
 	}), nil
+}
+
+func wrapFieldWithPrefix(f field.Field, p prefix.Prefixer) field.Field {
+	spec := f.Spec()
+	if spec == nil {
+		return f
+	}
+	copied := *spec
+	copied.Pref = p
+	switch f.(type) {
+	case *field.String:
+		return field.NewString(&copied)
+	case *field.Numeric:
+		return field.NewNumeric(&copied)
+	case *field.Binary:
+		return field.NewBinary(&copied)
+	case *field.Hex:
+		return field.NewHex(&copied)
+	case *field.Composite:
+		return field.NewComposite(&copied)
+	default:
+		return f
+	}
 }
 
 func xmlEncodeToMoov(enc string) encoding.Encoder {
@@ -386,7 +440,7 @@ func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte
 			if err := json.Unmarshal([]byte(val), &obj); err == nil && len(obj) > 0 {
 				for k, v := range obj {
 					path := fmt.Sprintf("%d.%s", row.id, strings.TrimSpace(k))
-					if err := msg.MarshalPath(path, v); err != nil {
+					if err := marshalISO8583PathValue(msg, path, v); err != nil {
 						return nil, nil, fmt.Errorf("iso8583 field %d path %s: %w", row.id, path, err)
 					}
 				}
@@ -402,6 +456,37 @@ func buildPayloadFromISO8583(step scenario.Step, vars map[string]string) ([]byte
 		return nil, nil, fmt.Errorf("iso8583 pack: %w", err)
 	}
 	return packed, sp, nil
+}
+
+func marshalISO8583PathValue(msg *iso8583lib.Message, path string, v any) error {
+	if err := msg.MarshalPath(path, v); err != nil {
+		s, ok := v.(string)
+		if !ok {
+			return err
+		}
+		trimmed := strings.TrimSpace(s)
+		if !isOddLengthHex(trimmed) || !strings.Contains(strings.ToLower(err.Error()), "odd length hex string") {
+			return err
+		}
+		// Частый случай EMV-тегов: значение приходит как n3 (например 643),
+		// а hex-поле ожидает четное число символов (0643).
+		return msg.MarshalPath(path, "0"+trimmed)
+	}
+	return nil
+}
+
+func isOddLengthHex(s string) bool {
+	if len(s) == 0 || len(s)%2 == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func tcpResponseISO8583Spec(step scenario.Step, buildSpec *iso8583lib.MessageSpec) (*iso8583lib.MessageSpec, error) {

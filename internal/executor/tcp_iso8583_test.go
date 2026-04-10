@@ -7,6 +7,9 @@ import (
 	"testing"
 
 	iso8583lib "github.com/moov-io/iso8583"
+	"github.com/moov-io/iso8583/encoding"
+	"github.com/moov-io/iso8583/field"
+	"github.com/moov-io/iso8583/prefix"
 
 	"gruzilla/internal/scenario"
 )
@@ -195,5 +198,89 @@ func TestBuildPayloadFromISO8583SpecXMLTLVField48(t *testing.T) {
 	msg := iso8583lib.NewMessage(spec)
 	if err := msg.Unpack(b); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBuildPayloadFromISO8583SpecXMLBerTLVField55(t *testing.T) {
+	dir := t.TempDir()
+	xmlPath := filepath.Join(dir, "BPC8583POS.xml")
+	xmlBody := `<Protocol id="6" name="BPC8583POS" type="ISO8583">
+	<Field name="MTI" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="4"></Field>
+	<Field name="BITMAP" fldType="ISOBITMAP" encode="BCH" format="*" lenType="FIX" len="8">
+		<Field id="3" name="F03" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="6"></Field>
+		<Field id="55" name="F55" fldType="TLV" encode="ASCII" format="ans" lenType="LLLVAR" len="999" tagType="BerTLVTag">
+			<Field name="F55.9F1A" tag="9F1A" fldType="GENERIC" encode="BCH" format="b" lenType="FIX" len="2"></Field>
+			<Field name="F55.5F24" tag="5F24" fldType="GENERIC" encode="BCH" format="b" lenType="FIX" len="3"></Field>
+		</Field>
+	</Field>
+</Protocol>`
+	if err := os.WriteFile(xmlPath, []byte(xmlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := scenario.Step{
+		TCPISO8583SpecXML: xmlPath,
+		TCPISO8583Fields: map[string]string{
+			"0":  "0200",
+			"3":  "000000",
+			"55": `{"9F1A":"643","5F24":"241231"}`,
+		},
+	}
+	_, spec, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c55, ok := spec.Fields[55].(*field.Composite)
+	if !ok {
+		t.Fatalf("field 55 must be composite, got %T", spec.Fields[55])
+	}
+	if c55.Spec().Tag.Enc != encoding.BerTLVTag {
+		t.Fatalf("field 55 tag encoding must be BerTLVTag")
+	}
+	for _, tag := range []string{"9F1A", "5F24"} {
+		sub := c55.Spec().Subfields[tag]
+		if sub == nil {
+			t.Fatalf("field 55 subfield %s missing", tag)
+		}
+		if sub.Spec().Pref != prefix.BerTLV {
+			t.Fatalf("field 55 subfield %s prefix must be BerTLV", tag)
+		}
+	}
+}
+
+func TestBuildPayloadFromISO8583SpecXMLField65OutsideBitmap(t *testing.T) {
+	dir := t.TempDir()
+	xmlPath := filepath.Join(dir, "BPC8583POS.xml")
+	xmlBody := `<Protocol id="6" name="BPC8583POS" type="ISO8583">
+	<Field name="MTI" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="4"></Field>
+	<Field name="BITMAP" fldType="ISOBITMAP" encode="BCH" format="*" lenType="FIX" len="8">
+		<Field id="3" name="F03" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="6"></Field>
+	</Field>
+	<Field id="66" name="F66" fldType="GENERIC" encode="ASCII" format="ans" lenType="FIX" len="2"></Field>
+</Protocol>`
+	if err := os.WriteFile(xmlPath, []byte(xmlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := scenario.Step{
+		TCPISO8583SpecXML: xmlPath,
+		TCPISO8583Fields: map[string]string{
+			"0":  "0200",
+			"3":  "000000",
+			"66": "AB",
+		},
+	}
+	b, spec, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := iso8583lib.NewMessage(spec)
+	if err := msg.Unpack(b); err != nil {
+		t.Fatal(err)
+	}
+	v, err := msg.GetString(66)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "AB" {
+		t.Fatalf("field 66: got %q want %q", v, "AB")
 	}
 }
