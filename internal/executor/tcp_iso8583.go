@@ -263,6 +263,14 @@ func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 		return nil, fmt.Errorf("invalid len %q", xf.Len)
 	}
 	enc := xmlEncodeToMoov(strings.TrimSpace(xf.Encode))
+	format := strings.ToLower(strings.TrimSpace(xf.Format))
+	isBinaryFormat := strings.HasPrefix(format, "b")
+	// Во многих XML выгрузках BCH/BCD встречается и у текстовых полей,
+	// где длина/значение на wire всё равно ASCII. Если формат не бинарный,
+	// используем ASCII-энкодер, чтобы не ломать var-length префиксы.
+	if !isBinaryFormat && enc == encoding.Binary {
+		enc = encoding.ASCII
+	}
 	pref, err := xmlLenTypeToMoovPrefix(strings.TrimSpace(xf.LenType), enc)
 	if err != nil {
 		return nil, err
@@ -273,9 +281,8 @@ func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 		Enc:         enc,
 		Pref:        pref,
 	}
-	format := strings.ToLower(strings.TrimSpace(xf.Format))
 	switch {
-	case strings.HasPrefix(format, "b"), strings.EqualFold(strings.TrimSpace(xf.Encode), "BCH"), strings.EqualFold(strings.TrimSpace(xf.Encode), "BCD"):
+	case isBinaryFormat:
 		return field.NewBinary(spec), nil
 	default:
 		// В runtime мы подаем значения как строки из сценария; String сохраняет ведущие нули
@@ -294,6 +301,10 @@ func makeTLVFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
 		return nil, fmt.Errorf("invalid len %q", xf.Len)
 	}
 	enc := xmlEncodeToMoov(strings.TrimSpace(xf.Encode))
+	format := strings.ToLower(strings.TrimSpace(xf.Format))
+	if !strings.HasPrefix(format, "b") && enc == encoding.Binary {
+		enc = encoding.ASCII
+	}
 	pref, err := xmlLenTypeToMoovPrefix(strings.TrimSpace(xf.LenType), enc)
 	if err != nil {
 		return nil, err

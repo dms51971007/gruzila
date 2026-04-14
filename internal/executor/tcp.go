@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	stdsort "sort"
 	"strconv"
 	"strings"
 	"time"
 
 	iso8583lib "github.com/moov-io/iso8583"
+	isoField "github.com/moov-io/iso8583/field"
 
 	"gruzilla/internal/scenario"
 )
@@ -78,6 +80,9 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 	frame, err := tcpWrapLengthPrefix(prefix, payload)
 	if err != nil {
 		return err
+	}
+	if isoBuildSpec != nil {
+		r.logISO8583FieldLengths(isoBuildSpec, payload, "tcp iso8583 payload")
 	}
 	r.logTCPHexDump("tcp payload (pre-frame)", "send", payload)
 	r.logTCPHexDump(fmt.Sprintf("tcp frame (prefix=%s)", valueOrDefault(prefix, "none")), "send", frame)
@@ -161,6 +166,94 @@ func valueOrDefault(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func (r *runner) logISO8583FieldLengths(spec *iso8583lib.MessageSpec, packed []byte, source string) {
+	if r == nil || spec == nil {
+		return
+	}
+	msg := iso8583lib.NewMessage(spec)
+	if err := msg.Unpack(packed); err != nil {
+		r.logTraffic(source, "debug", fmt.Sprintf("failed to unpack for field-length log: %v", err))
+		return
+	}
+	fields := msg.GetFields()
+	if len(fields) == 0 {
+		return
+	}
+	ids := make([]int, 0, len(fields))
+	for id := range fields {
+		ids = append(ids, id)
+	}
+	stdsort.Ints(ids)
+	var b strings.Builder
+	b.WriteString("ISO8583 field lengths:\n")
+	for _, id := range ids {
+		f := fields[id]
+		if f == nil || f.Spec() == nil {
+			continue
+		}
+		p, err := f.Pack()
+		if err != nil {
+			b.WriteString(fmt.Sprintf("  F%03d (%s): pack error: %v\n", id, f.Spec().Description, err))
+			continue
+		}
+		b.WriteString(fmt.Sprintf("  F%03d (%s): %d bytes\n", id, f.Spec().Description, len(p)))
+		appendFieldPrefixDebug(&b, p, f.Spec(), "    ")
+		if c, ok := f.(*isoField.Composite); ok {
+			appendCompositeSubfieldLengths(&b, c, "    ")
+		}
+	}
+	r.logTraffic(source, "debug", b.String())
+}
+
+func appendCompositeSubfieldLengths(b *strings.Builder, c *isoField.Composite, indent string) {
+	subs := c.GetSubfields()
+	if len(subs) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(subs))
+	for k := range subs {
+		keys = append(keys, k)
+	}
+	stdsort.Strings(keys)
+	for _, k := range keys {
+		sf := subs[k]
+		if sf == nil || sf.Spec() == nil {
+			continue
+		}
+		p, err := sf.Pack()
+		if err != nil {
+			b.WriteString(fmt.Sprintf("%s%s (%s): pack error: %v\n", indent, k, sf.Spec().Description, err))
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%s%s (%s): %d bytes\n", indent, k, sf.Spec().Description, len(p)))
+		appendFieldPrefixDebug(b, p, sf.Spec(), indent+"  ")
+		if nested, ok := sf.(*isoField.Composite); ok {
+			appendCompositeSubfieldLengths(b, nested, indent+"  ")
+		}
+	}
+}
+
+func appendFieldPrefixDebug(b *strings.Builder, packed []byte, spec *isoField.Spec, indent string) {
+	if b == nil || spec == nil || spec.Pref == nil || len(packed) == 0 {
+		return
+	}
+	dataLen, readLen, err := spec.Pref.DecodeLength(spec.Length, packed)
+	if err != nil || readLen <= 0 || readLen > len(packed) {
+		return
+	}
+	prefixHex := strings.ToUpper(hex.EncodeToString(packed[:readLen]))
+	value := packed[readLen:]
+	startN := 8
+	if len(value) < startN {
+		startN = len(value)
+	}
+	valueStartHex := strings.ToUpper(hex.EncodeToString(value[:startN]))
+	b.WriteString(fmt.Sprintf("%sprefix bytes: %s (declared=%d)\n", indent, prefixHex, dataLen))
+	if startN > 0 {
+		b.WriteString(fmt.Sprintf("%svalue starts: %s\n", indent, valueStartHex))
+	}
 }
 
 func (r *runner) tcpHandleResponse(step scenario.Step, vars map[string]string, resp []byte, respHex string, isoBuildSpec *iso8583lib.MessageSpec) error {
