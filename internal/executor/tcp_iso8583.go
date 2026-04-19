@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	stdsort "sort"
@@ -143,12 +144,168 @@ func loadISO8583SpecFromXML(path string) (*iso8583lib.MessageSpec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tcp_iso8583_spec_xml: %w", err)
 	}
+	logISO8583ParsedSpecJSON(absPath, sp)
 	iso8583XMLSpecCache.Store(absPath, xmlSpecCacheEntry{
 		modTime: st.ModTime(),
 		size:    st.Size(),
 		spec:    sp,
 	})
 	return sp, nil
+}
+
+type iso8583SpecLogField struct {
+	ID          int                  `json:"id"`
+	Type        string               `json:"type"`
+	Description string               `json:"description,omitempty"`
+	Length      int                  `json:"length"`
+	Encoding    string               `json:"encoding,omitempty"`
+	Prefix      string               `json:"prefix,omitempty"`
+	TagLength   int                  `json:"tag_length,omitempty"`
+	TagEncoding string               `json:"tag_encoding,omitempty"`
+	Subfields   []iso8583SpecLogNode `json:"subfields,omitempty"`
+}
+
+type iso8583SpecLogNode struct {
+	Key         string               `json:"key"`
+	Type        string               `json:"type"`
+	Description string               `json:"description,omitempty"`
+	Length      int                  `json:"length"`
+	Encoding    string               `json:"encoding,omitempty"`
+	Prefix      string               `json:"prefix,omitempty"`
+	TagLength   int                  `json:"tag_length,omitempty"`
+	TagEncoding string               `json:"tag_encoding,omitempty"`
+	Subfields   []iso8583SpecLogNode `json:"subfields,omitempty"`
+}
+
+type iso8583SpecLogPayload struct {
+	Event      string                `json:"event"`
+	SpecSource string                `json:"spec_source"`
+	SpecName   string                `json:"spec_name"`
+	FieldCount int                   `json:"field_count"`
+	Fields     []iso8583SpecLogField `json:"fields"`
+}
+
+func logISO8583ParsedSpecJSON(absPath string, sp *iso8583lib.MessageSpec) {
+	if sp == nil {
+		return
+	}
+	ids := make([]int, 0, len(sp.Fields))
+	for id := range sp.Fields {
+		ids = append(ids, id)
+	}
+	stdsort.Ints(ids)
+	fields := make([]iso8583SpecLogField, 0, len(ids))
+	for _, id := range ids {
+		f := sp.Fields[id]
+		if f == nil {
+			continue
+		}
+		fields = append(fields, iso8583SpecLogField{
+			ID:          id,
+			Type:        iso8583FieldTypeName(f),
+			Description: iso8583FieldDescription(f),
+			Length:      iso8583FieldLength(f),
+			Encoding:    iso8583FieldEncodingName(f),
+			Prefix:      iso8583FieldPrefixName(f),
+			TagLength:   iso8583FieldTagLength(f),
+			TagEncoding: iso8583FieldTagEncodingName(f),
+			Subfields:   iso8583LogSubfields(f),
+		})
+	}
+	payload := iso8583SpecLogPayload{
+		Event:      "iso8583_spec_parsed",
+		SpecSource: absPath,
+		SpecName:   strings.TrimSpace(sp.Name),
+		FieldCount: len(fields),
+		Fields:     fields,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[iso8583_spec] marshal error: %v", err)
+		return
+	}
+	log.Printf("[iso8583_spec] %s", string(b))
+}
+
+func iso8583LogSubfields(f field.Field) []iso8583SpecLogNode {
+	c, ok := f.(*field.Composite)
+	if !ok {
+		return nil
+	}
+	sub := c.GetSubfields()
+	if len(sub) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(sub))
+	for k := range sub {
+		keys = append(keys, k)
+	}
+	stdsort.Strings(keys)
+	out := make([]iso8583SpecLogNode, 0, len(keys))
+	for _, k := range keys {
+		sf := sub[k]
+		if sf == nil {
+			continue
+		}
+		out = append(out, iso8583SpecLogNode{
+			Key:         k,
+			Type:        iso8583FieldTypeName(sf),
+			Description: iso8583FieldDescription(sf),
+			Length:      iso8583FieldLength(sf),
+			Encoding:    iso8583FieldEncodingName(sf),
+			Prefix:      iso8583FieldPrefixName(sf),
+			TagLength:   iso8583FieldTagLength(sf),
+			TagEncoding: iso8583FieldTagEncodingName(sf),
+			Subfields:   iso8583LogSubfields(sf),
+		})
+	}
+	return out
+}
+
+func iso8583FieldTypeName(f field.Field) string {
+	return strings.TrimPrefix(fmt.Sprintf("%T", f), "*field.")
+}
+
+func iso8583FieldDescription(f field.Field) string {
+	if f == nil || f.Spec() == nil {
+		return ""
+	}
+	return strings.TrimSpace(f.Spec().Description)
+}
+
+func iso8583FieldLength(f field.Field) int {
+	if f == nil || f.Spec() == nil {
+		return 0
+	}
+	return f.Spec().Length
+}
+
+func iso8583FieldEncodingName(f field.Field) string {
+	if f == nil || f.Spec() == nil || f.Spec().Enc == nil {
+		return ""
+	}
+	return strings.TrimPrefix(fmt.Sprintf("%T", f.Spec().Enc), "encoding.")
+}
+
+func iso8583FieldPrefixName(f field.Field) string {
+	if f == nil || f.Spec() == nil || f.Spec().Pref == nil {
+		return ""
+	}
+	return strings.TrimPrefix(fmt.Sprintf("%T", f.Spec().Pref), "prefix.")
+}
+
+func iso8583FieldTagLength(f field.Field) int {
+	if f == nil || f.Spec() == nil || f.Spec().Tag == nil {
+		return 0
+	}
+	return f.Spec().Tag.Length
+}
+
+func iso8583FieldTagEncodingName(f field.Field) string {
+	if f == nil || f.Spec() == nil || f.Spec().Tag == nil || f.Spec().Tag.Enc == nil {
+		return ""
+	}
+	return strings.TrimPrefix(fmt.Sprintf("%T", f.Spec().Tag.Enc), "encoding.")
 }
 
 func sanitizeISO8583XML(data []byte) []byte {
@@ -215,16 +372,8 @@ func buildMessageSpecFromXMLProtocol(proto xmlProtocolSpec) (*iso8583lib.Message
 		Enc:         encoding.Binary,
 		Pref:        prefix.Binary.Fixed,
 	})
-	for _, xf := range bitmap.Fields {
-		id, err := strconv.Atoi(strings.TrimSpace(xf.ID))
-		if err != nil || id <= 1 {
-			continue
-		}
-		ff, err := makeFieldFromXML(xf)
-		if err != nil {
-			return nil, fmt.Errorf("field id=%d name=%q: %w", id, xf.Name, err)
-		}
-		fields[id] = ff
+	if err := collectISO8583FieldsFromXML(fields, bitmap.Fields); err != nil {
+		return nil, err
 	}
 	// Некоторые выгрузки описывают дополнительные поля (например 65+) вне BITMAP.
 	// Подхватываем их тоже, если это валидные ISO-поля.
@@ -247,6 +396,29 @@ func buildMessageSpecFromXMLProtocol(proto xmlProtocolSpec) (*iso8583lib.Message
 		name = "ISO8583 from XML"
 	}
 	return &iso8583lib.MessageSpec{Name: name, Fields: fields}, nil
+}
+
+func collectISO8583FieldsFromXML(dst map[int]field.Field, nodes []xmlFieldSpec) error {
+	for _, xf := range nodes {
+		if len(xf.Fields) > 0 {
+			if err := collectISO8583FieldsFromXML(dst, xf.Fields); err != nil {
+				return err
+			}
+		}
+		id, err := strconv.Atoi(strings.TrimSpace(xf.ID))
+		if err != nil || id <= 1 {
+			continue
+		}
+		if _, exists := dst[id]; exists {
+			continue
+		}
+		ff, err := makeFieldFromXML(xf)
+		if err != nil {
+			return fmt.Errorf("field id=%d name=%q: %w", id, xf.Name, err)
+		}
+		dst[id] = ff
+	}
+	return nil
 }
 
 func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {
