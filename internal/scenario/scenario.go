@@ -100,6 +100,7 @@ type Step struct {
 	TCPAddr              string `yaml:"tcp_addr,omitempty" json:"tcp_addr,omitempty"` // host:port
 	TCPDialTimeoutMS     int    `yaml:"tcp_dial_timeout_ms,omitempty" json:"tcp_dial_timeout_ms,omitempty"`
 	TCPReadTimeoutMS     int    `yaml:"tcp_read_timeout_ms,omitempty" json:"tcp_read_timeout_ms,omitempty"`
+	TCPPoolSize          int    `yaml:"tcp_pool_size,omitempty" json:"tcp_pool_size,omitempty"` // 0/1 — без пула; >1 — размер пула соединений для шага
 	TCPLengthPrefix      string `yaml:"tcp_length_prefix,omitempty" json:"tcp_length_prefix,omitempty"`       // "" | 2be | 4be | 4ascii | 6ascii (см. executor/tcp.go)
 	TCPPayload           string `yaml:"tcp_payload,omitempty" json:"tcp_payload,omitempty"`                   // после подстановок: utf8 (по умолчанию) или iso8859_1 — см. tcp_payload_encoding
 	TCPPayloadEncoding   string `yaml:"tcp_payload_encoding,omitempty" json:"tcp_payload_encoding,omitempty"` // ""|utf8 — UTF-8; iso8859_1|latin1 — один байт на U+00..U+FF (только для tcp_payload)
@@ -408,6 +409,9 @@ func Validate(sc Scenario) error {
 		case "tcp", "tcp_iso8583_xml":
 			if st.TCPAddr == "" {
 				return fmt.Errorf("step[%d].tcp_addr is required for %s", i, st.Type)
+			}
+			if st.TCPPoolSize < 0 {
+				return fmt.Errorf("step[%d].tcp_pool_size must be >= 0", i)
 			}
 			iso := len(st.TCPISO8583Fields) > 0
 			raw := strings.TrimSpace(st.TCPPayload) != "" || strings.TrimSpace(st.TCPPayloadHex) != ""

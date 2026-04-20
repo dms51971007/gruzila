@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	stdsort "sort"
 	"strconv"
 	"strings"
@@ -73,6 +74,9 @@ type xmlSpecCacheEntry struct {
 }
 
 var iso8583XMLSpecCache sync.Map // key: absolute path, value: xmlSpecCacheEntry
+
+var iso8583FieldIDPattern = regexp.MustCompile(`\d+`)
+var iso8583FieldNamePattern = regexp.MustCompile(`(?i)^F0*(\d+)$`)
 
 type xmlProtocolSpec struct {
 	Name   string         `xml:"name,attr"`
@@ -378,8 +382,8 @@ func buildMessageSpecFromXMLProtocol(proto xmlProtocolSpec) (*iso8583lib.Message
 	// Некоторые выгрузки описывают дополнительные поля (например 65+) вне BITMAP.
 	// Подхватываем их тоже, если это валидные ISO-поля.
 	for _, xf := range proto.Fields {
-		id, err := strconv.Atoi(strings.TrimSpace(xf.ID))
-		if err != nil || id <= 1 {
+		id, ok := parseISO8583FieldNumberFromXML(xf)
+		if !ok || id <= 1 {
 			continue
 		}
 		if _, exists := fields[id]; exists {
@@ -405,8 +409,8 @@ func collectISO8583FieldsFromXML(dst map[int]field.Field, nodes []xmlFieldSpec) 
 				return err
 			}
 		}
-		id, err := strconv.Atoi(strings.TrimSpace(xf.ID))
-		if err != nil || id <= 1 {
+		id, ok := parseISO8583FieldNumberFromXML(xf)
+		if !ok || id <= 1 {
 			continue
 		}
 		if _, exists := dst[id]; exists {
@@ -419,6 +423,46 @@ func collectISO8583FieldsFromXML(dst map[int]field.Field, nodes []xmlFieldSpec) 
 		dst[id] = ff
 	}
 	return nil
+}
+
+func parseISO8583FieldID(raw string) (int, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, false
+	}
+	if id, err := strconv.Atoi(s); err == nil {
+		return id, true
+	}
+	// Встречаются id в виде "64+" / "DE64+" / "F064+" в выгрузках XML.
+	// Берем первую непрерывную числовую группу как номер ISO-поля.
+	match := iso8583FieldIDPattern.FindString(s)
+	if match == "" {
+		return 0, false
+	}
+	id, err := strconv.Atoi(match)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
+}
+
+func parseISO8583FieldNumberFromXML(xf xmlFieldSpec) (int, bool) {
+	if id, ok := parseISO8583FieldID(xf.ID); ok {
+		return id, true
+	}
+	name := strings.TrimSpace(xf.Name)
+	if name == "" {
+		return 0, false
+	}
+	m := iso8583FieldNamePattern.FindStringSubmatch(name)
+	if len(m) != 2 {
+		return 0, false
+	}
+	id, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 func makeFieldFromXML(xf xmlFieldSpec) (field.Field, error) {

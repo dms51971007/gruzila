@@ -1,9 +1,13 @@
 package executor
 
 import (
+	"encoding/xml"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	iso8583lib "github.com/moov-io/iso8583"
@@ -285,5 +289,181 @@ func TestBuildPayloadFromISO8583SpecXMLField65OutsideBitmap(t *testing.T) {
 	}
 	if v != "AB" {
 		t.Fatalf("field 66: got %q want %q", v, "AB")
+	}
+}
+
+func TestBuildPayloadFromISO8583SpecXMLFieldIDWithPlusSuffix(t *testing.T) {
+	dir := t.TempDir()
+	xmlPath := filepath.Join(dir, "BPC8583POS.xml")
+	xmlBody := `<Protocol id="6" name="BPC8583POS" type="ISO8583">
+	<Field name="MTI" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="4"></Field>
+	<Field name="BITMAP" fldType="ISOBITMAP" encode="BCH" format="*" lenType="FIX" len="8">
+		<Field id="3" name="F03" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="6"></Field>
+		<Field id="64+" name="F64+" fldType="GENERIC" encode="ASCII" format="ans" lenType="FIX" len="8"></Field>
+	</Field>
+</Protocol>`
+	if err := os.WriteFile(xmlPath, []byte(xmlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := scenario.Step{
+		TCPISO8583SpecXML: xmlPath,
+		TCPISO8583Fields: map[string]string{
+			"0":  "0200",
+			"3":  "000000",
+			"64": "ABCDEFGH",
+		},
+	}
+	b, spec, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := iso8583lib.NewMessage(spec)
+	if err := msg.Unpack(b); err != nil {
+		t.Fatal(err)
+	}
+	v, err := msg.GetString(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "ABCDEFGH" {
+		t.Fatalf("field 64: got %q want %q", v, "ABCDEFGH")
+	}
+}
+
+func TestBuildPayloadFromISO8583SpecXMLFieldNameFallbackID(t *testing.T) {
+	dir := t.TempDir()
+	xmlPath := filepath.Join(dir, "BPC8583POS.xml")
+	xmlBody := `<Protocol id="6" name="BPC8583POS" type="ISO8583">
+	<Field name="MTI" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="4"></Field>
+	<Field name="BITMAP" fldType="ISOBITMAP" encode="BCH" format="*" lenType="FIX" len="8">
+		<Field id="3" name="F03" fldType="GENERIC" encode="ASCII" format="n" lenType="FIX" len="6"></Field>
+	</Field>
+	<Field name="F95" fldType="GENERIC" encode="ASCII" format="ans" lenType="FIX" len="12"></Field>
+</Protocol>`
+	if err := os.WriteFile(xmlPath, []byte(xmlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := scenario.Step{
+		TCPISO8583SpecXML: xmlPath,
+		TCPISO8583Fields: map[string]string{
+			"0":  "0200",
+			"3":  "000000",
+			"95": "123456789012",
+		},
+	}
+	b, spec, err := buildPayloadFromISO8583(step, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := iso8583lib.NewMessage(spec)
+	if err := msg.Unpack(b); err != nil {
+		t.Fatal(err)
+	}
+	v, err := msg.GetString(95)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "123456789012" {
+		t.Fatalf("field 95: got %q want %q", v, "123456789012")
+	}
+}
+
+func TestAuditISO8583XMLFieldByField(t *testing.T) {
+	xmlPath := strings.TrimSpace(os.Getenv("BPC_XML_AUDIT_PATH"))
+	if xmlPath == "" {
+		t.Skip("set BPC_XML_AUDIT_PATH to run XML field-by-field audit")
+	}
+	data, err := os.ReadFile(xmlPath)
+	if err != nil {
+		t.Fatalf("read xml: %v", err)
+	}
+	var proto xmlProtocolSpec
+	if err := xml.Unmarshal(data, &proto); err != nil {
+		clean := sanitizeISO8583XML(data)
+		if err2 := xml.Unmarshal(clean, &proto); err2 != nil {
+			t.Fatalf("parse xml: %v", err2)
+		}
+	}
+	sp, err := buildMessageSpecFromXMLProtocol(proto)
+	if err != nil {
+		t.Fatalf("build spec: %v", err)
+	}
+
+	type row struct {
+		id      string
+		name    string
+		fldType string
+		status  string
+		detail  string
+	}
+	rows := make([]row, 0, 512)
+	var walk func([]xmlFieldSpec)
+	walk = func(nodes []xmlFieldSpec) {
+		for _, xf := range nodes {
+			idNum, ok := parseISO8583FieldID(xf.ID)
+			idText := strings.TrimSpace(xf.ID)
+			if idText == "" {
+				idText = "-"
+			}
+			name := strings.TrimSpace(xf.Name)
+			if name == "" {
+				name = strings.TrimSpace(xf.Tag)
+			}
+			if name == "" {
+				name = "<unnamed>"
+			}
+
+			switch {
+			case strings.EqualFold(name, "MTI"), strings.EqualFold(name, "BITMAP"):
+				rows = append(rows, row{id: idText, name: name, fldType: xf.FldType, status: "skip", detail: "system field"})
+			case !ok:
+				rows = append(rows, row{id: idText, name: name, fldType: xf.FldType, status: "warn", detail: "id not recognized"})
+			default:
+				f, ferr := makeFieldFromXML(xf)
+				if ferr != nil {
+					rows = append(rows, row{id: fmt.Sprintf("%d", idNum), name: name, fldType: xf.FldType, status: "error", detail: ferr.Error()})
+				} else {
+					spec := f.Spec()
+					rows = append(rows, row{
+						id:      fmt.Sprintf("%d", idNum),
+						name:    name,
+						fldType: xf.FldType,
+						status:  "ok",
+						detail:  fmt.Sprintf("len=%d pref=%T enc=%T", spec.Length, spec.Pref, spec.Enc),
+					})
+				}
+			}
+			if len(xf.Fields) > 0 {
+				walk(xf.Fields)
+			}
+		}
+	}
+	walk(proto.Fields)
+
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].status != rows[j].status {
+			return rows[i].status < rows[j].status
+		}
+		if rows[i].id != rows[j].id {
+			return rows[i].id < rows[j].id
+		}
+		return rows[i].name < rows[j].name
+	})
+
+	okCnt, warnCnt, errCnt := 0, 0, 0
+	for _, r := range rows {
+		switch r.status {
+		case "ok":
+			okCnt++
+		case "warn":
+			warnCnt++
+		case "error":
+			errCnt++
+		}
+		t.Logf("[%s] id=%s name=%q type=%q %s", r.status, r.id, r.name, r.fldType, r.detail)
+	}
+	t.Logf("summary: parsed_spec_fields=%d audit_rows=%d ok=%d warn=%d error=%d", len(sp.Fields), len(rows), okCnt, warnCnt, errCnt)
+	if errCnt > 0 {
+		t.Fatalf("xml audit found %d errors", errCnt)
 	}
 }

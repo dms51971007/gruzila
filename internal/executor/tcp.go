@@ -100,12 +100,110 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 		readCap = tcpDefaultReadCap
 	}
 
+	conn, fromPool, err := r.acquireTCPConn(step, vars, addr, dialMS)
+	if err != nil {
+		return err
+	}
+	reusable := true
+	defer func() {
+		if reusable && fromPool {
+			r.releaseTCPConn(step, vars, addr, conn)
+			return
+		}
+		_ = conn.Close()
+	}()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Duration(readMS) * time.Millisecond))
+	if _, err := conn.Write(frame); err != nil {
+		reusable = false
+		return fmt.Errorf("tcp write: %w", err)
+	}
+	tcpSrc := fmt.Sprintf("tcp %s", addr)
+	r.logTraffic(tcpSrc, "send", hex.EncodeToString(frame))
+
+	resp, err := tcpReadResponse(conn, prefix, readCap, readMS)
+	if err != nil {
+		reusable = false
+		return err
+	}
+
+	respHex := hex.EncodeToString(resp)
+	r.logTraffic(tcpSrc, "recv", respHex)
+	return r.tcpHandleResponse(step, vars, resp, respHex, isoBuildSpec)
+}
+
+type tcpConnPool struct {
+	conns chan net.Conn
+}
+
+func (r *runner) acquireTCPConn(step scenario.Step, vars map[string]string, addr string, dialMS int) (net.Conn, bool, error) {
+	poolSize := step.TCPPoolSize
+	if poolSize <= 1 {
+		c, err := dialTCPConn(step, vars, addr, dialMS)
+		if err != nil {
+			return nil, false, err
+		}
+		return c, false, nil
+	}
+	key := tcpPoolKey(step, vars, addr)
+	p := r.getOrCreateTCPPool(key, poolSize)
+	select {
+	case c := <-p.conns:
+		if c != nil {
+			return c, true, nil
+		}
+	default:
+	}
+	c, err := dialTCPConn(step, vars, addr, dialMS)
+	if err != nil {
+		return nil, true, err
+	}
+	return c, true, nil
+}
+
+func (r *runner) releaseTCPConn(step scenario.Step, vars map[string]string, addr string, c net.Conn) {
+	if c == nil {
+		return
+	}
+	poolSize := step.TCPPoolSize
+	if poolSize <= 1 {
+		_ = c.Close()
+		return
+	}
+	key := tcpPoolKey(step, vars, addr)
+	p := r.getOrCreateTCPPool(key, poolSize)
+	select {
+	case p.conns <- c:
+	default:
+		_ = c.Close()
+	}
+}
+
+func (r *runner) getOrCreateTCPPool(key string, size int) *tcpConnPool {
+	r.tcpMu.Lock()
+	defer r.tcpMu.Unlock()
+	if p, ok := r.tcpPool[key]; ok {
+		return p
+	}
+	p := &tcpConnPool{conns: make(chan net.Conn, size)}
+	r.tcpPool[key] = p
+	return p
+}
+
+func tcpPoolKey(step scenario.Step, vars map[string]string, addr string) string {
+	if !step.TCPTLS {
+		return "tcp|" + addr
+	}
+	sn := strings.TrimSpace(interpolate(vars, step.TCPTLSServerName))
+	return fmt.Sprintf("tls|%s|insecure=%t|sn=%s", addr, step.TCPTLSInsecure, sn)
+}
+
+func dialTCPConn(step scenario.Step, vars map[string]string, addr string, dialMS int) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: time.Duration(dialMS) * time.Millisecond}
-	var conn net.Conn
 	if step.TCPTLS {
 		host, _, splitErr := net.SplitHostPort(addr)
 		if splitErr != nil {
-			return fmt.Errorf("tcp tls: %w", splitErr)
+			return nil, fmt.Errorf("tcp tls: %w", splitErr)
 		}
 		sn := strings.TrimSpace(interpolate(vars, step.TCPTLSServerName))
 		if sn == "" {
@@ -117,37 +215,19 @@ func (r *runner) executeTCP(step scenario.Step, vars map[string]string) error {
 			MinVersion:         tls.VersionTLS12,
 		}
 		if !step.TCPTLSInsecure && sn == "" {
-			return fmt.Errorf("tcp tls: set tcp_tls_server_name or use host:port with hostname")
+			return nil, fmt.Errorf("tcp tls: set tcp_tls_server_name or use host:port with hostname")
 		}
 		tconn, err := tls.DialWithDialer(&dialer, "tcp", addr, tlsCfg)
 		if err != nil {
-			return fmt.Errorf("tcp tls dial %s: %w", addr, err)
+			return nil, fmt.Errorf("tcp tls dial %s: %w", addr, err)
 		}
-		conn = tconn
-	} else {
-		c, err := dialer.Dial("tcp", addr)
-		if err != nil {
-			return fmt.Errorf("tcp dial %s: %w", addr, err)
-		}
-		conn = c
+		return tconn, nil
 	}
-	defer func() { _ = conn.Close() }()
-
-	_ = conn.SetWriteDeadline(time.Now().Add(time.Duration(readMS) * time.Millisecond))
-	if _, err := conn.Write(frame); err != nil {
-		return fmt.Errorf("tcp write: %w", err)
-	}
-	tcpSrc := fmt.Sprintf("tcp %s", addr)
-	r.logTraffic(tcpSrc, "send", hex.EncodeToString(frame))
-
-	resp, err := tcpReadResponse(conn, prefix, readCap, readMS)
+	c, err := dialer.Dial("tcp", addr)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("tcp dial %s: %w", addr, err)
 	}
-
-	respHex := hex.EncodeToString(resp)
-	r.logTraffic(tcpSrc, "recv", respHex)
-	return r.tcpHandleResponse(step, vars, resp, respHex, isoBuildSpec)
+	return c, nil
 }
 
 func (r *runner) logTCPHexDump(label, direction string, data []byte) {
@@ -198,7 +278,7 @@ func (r *runner) logISO8583FieldLengths(spec *iso8583lib.MessageSpec, packed []b
 			b.WriteString(fmt.Sprintf("  F%03d (%s): pack error: %v\n", id, f.Spec().Description, err))
 			continue
 		}
-		b.WriteString(fmt.Sprintf("  F%03d (%s): %d bytes\n", id, f.Spec().Description, len(p)))
+		b.WriteString(fmt.Sprintf("  F%03d (%s): %d bytes\n", id, compactISO8583Desc(f.Spec().Description), len(p)))
 		appendFieldPrefixDebug(&b, p, f.Spec(), "    ")
 		if c, ok := f.(*isoField.Composite); ok {
 			appendCompositeSubfieldLengths(&b, c, "    ")
@@ -227,7 +307,7 @@ func appendCompositeSubfieldLengths(b *strings.Builder, c *isoField.Composite, i
 			b.WriteString(fmt.Sprintf("%s%s (%s): pack error: %v\n", indent, k, sf.Spec().Description, err))
 			continue
 		}
-		b.WriteString(fmt.Sprintf("%s%s (%s): %d bytes\n", indent, k, sf.Spec().Description, len(p)))
+		b.WriteString(fmt.Sprintf("%s%s (%s): %d bytes\n", indent, k, compactISO8583Desc(sf.Spec().Description), len(p)))
 		appendFieldPrefixDebug(b, p, sf.Spec(), indent+"  ")
 		if nested, ok := sf.(*isoField.Composite); ok {
 			appendCompositeSubfieldLengths(b, nested, indent+"  ")
@@ -243,6 +323,12 @@ func appendFieldPrefixDebug(b *strings.Builder, packed []byte, spec *isoField.Sp
 	if err != nil || readLen <= 0 || readLen > len(packed) {
 		return
 	}
+	// Для ASCII-префиксов некоторых TLV-подполей DecodeLength может отдавать
+	// заниженное значение в debug-режиме (например "015" -> 5). Логируем
+	// фактическое десятичное значение префикса, чтобы не путать диагностику.
+	if n, ok := parseASCIIDecimalPrefixLen(packed[:readLen]); ok {
+		dataLen = n
+	}
 	prefixHex := strings.ToUpper(hex.EncodeToString(packed[:readLen]))
 	value := packed[readLen:]
 	startN := 8
@@ -254,6 +340,38 @@ func appendFieldPrefixDebug(b *strings.Builder, packed []byte, spec *isoField.Sp
 	if startN > 0 {
 		b.WriteString(fmt.Sprintf("%svalue starts: %s\n", indent, valueStartHex))
 	}
+}
+
+func parseASCIIDecimalPrefixLen(prefix []byte) (int, bool) {
+	if len(prefix) == 0 {
+		return 0, false
+	}
+	for _, b := range prefix {
+		if b < '0' || b > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(string(prefix))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func compactISO8583Desc(s string) string {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return ""
+	}
+	v = strings.ReplaceAll(v, "\r\n", "\n")
+	if i := strings.IndexByte(v, '\n'); i >= 0 {
+		v = v[:i]
+	}
+	const maxLen = 72
+	if len(v) > maxLen {
+		v = strings.TrimSpace(v[:maxLen-3]) + "..."
+	}
+	return v
 }
 
 func (r *runner) tcpHandleResponse(step scenario.Step, vars map[string]string, resp []byte, respHex string, isoBuildSpec *iso8583lib.MessageSpec) error {

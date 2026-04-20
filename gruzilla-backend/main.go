@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -91,6 +92,10 @@ func main() {
 	mux.HandleFunc("/api/v1/templates/create", h.onlyPOST(h.templatesCreate))
 	mux.HandleFunc("/api/v1/templates/update", h.onlyPOST(h.templatesUpdate))
 	mux.HandleFunc("/api/v1/templates/delete", h.onlyPOST(h.templatesDelete))
+	if frontendDir := detectFrontendDistDir(cfg.CLIWorkDir); frontendDir != "" {
+		log.Printf("frontend static enabled: %s", frontendDir)
+		mux.Handle("/", newSPAFileHandler(frontendDir))
+	}
 
 	srv := &http.Server{
 		Addr:         cfg.Addr,
@@ -172,6 +177,7 @@ func loadConfig(configPath string) config {
 		cfg.ExecutorLogFile = v
 	}
 	cfg.CLIWorkDir = resolveCLIWorkDir(cfg.CLIWorkDir, absConfigPath)
+	autodetectCLIExecutable(&cfg)
 
 	log.Printf("config loaded: addr=%s cli=%s args=%v workdir=%s timeout=%ds default_executor_url=%s executor_logs_enabled=%t executor_log_file=%s",
 		cfg.Addr, cfg.CLICommand, cfg.CLIArgs, cfg.CLIWorkDir, cfg.CLITimeoutSeconds, cfg.DefaultExecutorURL, cfg.ExecutorLogsEnabled, cfg.ExecutorLogFile)
@@ -255,6 +261,117 @@ func resolveCLIWorkDir(rawWorkDir, absConfigPath string) string {
 func pathExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func autodetectCLIExecutable(cfg *config) {
+	if cfg == nil || !isGoRunCLIConfig(cfg.CLICommand, cfg.CLIArgs) {
+		return
+	}
+	// Режим исходников: оставляем go run как есть.
+	if pathExists(filepath.Join(cfg.CLIWorkDir, "cmd", "gruzilla-cli", "main.go")) {
+		return
+	}
+	for _, candidate := range cliExecutableCandidates(cfg.CLIWorkDir) {
+		if !pathExists(candidate) {
+			continue
+		}
+		cfg.CLICommand = candidate
+		cfg.CLIArgs = nil
+		log.Printf("cli autodetect: source tree not found, switched to binary %q", candidate)
+		return
+	}
+}
+
+func isGoRunCLIConfig(command string, args []string) bool {
+	if !strings.EqualFold(strings.TrimSpace(command), "go") || len(args) < 2 {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(args[0]), "run") {
+		return false
+	}
+	return strings.Contains(filepath.ToSlash(strings.TrimSpace(args[1])), "cmd/gruzilla-cli")
+}
+
+func cliExecutableCandidates(workDir string) []string {
+	name := "gruzilla-cli"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	out := make([]string, 0, 4)
+	if wd := strings.TrimSpace(workDir); wd != "" {
+		out = append(out, filepath.Join(wd, name))
+		out = append(out, filepath.Join(wd, "bin", name))
+	}
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		out = append(out, filepath.Join(exeDir, name))
+	}
+	return uniqueNonEmptyPaths(out)
+}
+
+func uniqueNonEmptyPaths(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		p := strings.TrimSpace(it)
+		if p == "" {
+			continue
+		}
+		key := strings.ToLower(filepath.Clean(p))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+func detectFrontendDistDir(workDir string) string {
+	candidates := make([]string, 0, 4)
+	if wd := strings.TrimSpace(workDir); wd != "" {
+		candidates = append(candidates, filepath.Join(wd, "gruzilla-frontend", "dist"))
+		candidates = append(candidates, filepath.Join(wd, "dist"))
+	}
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates = append(candidates, filepath.Join(exeDir, "gruzilla-frontend", "dist"))
+		candidates = append(candidates, filepath.Join(exeDir, "dist"))
+	}
+	for _, dir := range uniqueNonEmptyPaths(candidates) {
+		if !pathExists(filepath.Join(dir, "index.html")) {
+			continue
+		}
+		return dir
+	}
+	return ""
+}
+
+type spaFileHandler struct {
+	rootDir string
+}
+
+func newSPAFileHandler(rootDir string) http.Handler {
+	return &spaFileHandler{rootDir: rootDir}
+}
+
+func (h *spaFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.NotFound(w, r)
+		return
+	}
+	reqPath := filepath.Clean("/" + strings.TrimSpace(r.URL.Path))
+	if reqPath == "/" {
+		http.ServeFile(w, r, filepath.Join(h.rootDir, "index.html"))
+		return
+	}
+	target := filepath.Join(h.rootDir, reqPath[1:])
+	if st, err := os.Stat(target); err == nil && !st.IsDir() {
+		http.ServeFile(w, r, target)
+		return
+	}
+	// SPA routing: любые неизвестные пути отдаём index.html.
+	http.ServeFile(w, r, filepath.Join(h.rootDir, "index.html"))
 }
 
 func envOrDefault(key, fallback string) string {

@@ -729,6 +729,8 @@ type runner struct {
 	kafkaWriter  map[string]*kafka.Writer
 	dbMu         sync.Mutex
 	dbPool       map[string]*sql.DB
+	tcpMu        sync.Mutex
+	tcpPool      map[string]*tcpConnPool
 }
 
 // newRunner создаёт runner с переиспользуемыми HTTP/Kafka/DB-клиентами.
@@ -742,6 +744,7 @@ func newRunner(buildVars func() map[string]string, onStepFinish func(int, scenar
 		trafficLogs:  trafficLogs,
 		kafkaWriter:  make(map[string]*kafka.Writer),
 		dbPool:       make(map[string]*sql.DB),
+		tcpPool:      make(map[string]*tcpConnPool),
 	}
 }
 

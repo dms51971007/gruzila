@@ -388,6 +388,14 @@ go run ./cmd/gruzilla-cli templates delete --path "new.json.tmpl" --dir "templat
 - `tcp_iso8583_spec_xml` — путь к XML-файлу спецификации;
 - `tcp_iso8583_fields` — карта `номер_поля -> значение`;
 - `tcp_length_prefix` — префикс длины TCP кадра (`4ascii`, `2be`, и т.д.).
+- `tcp_pool_size` — размер пула TCP-соединений для шага (`0/1` — без пула, `>1` — переиспользование соединений между итерациями).
+
+### TCP connection pool (`tcp_pool_size`)
+
+- `tcp_pool_size: 0` или `1` — поведение как раньше: соединение открывается на шаг и закрывается после ответа.
+- `tcp_pool_size: N` (`N > 1`) — используется пул до `N` соединений для данного `tcp_addr` (и TLS-параметров); после успешного шага соединение возвращается в пул.
+- При ошибке чтения/записи проблемное соединение в пул не возвращается и закрывается.
+- Если пул заполнен, «лишнее» соединение закрывается.
 
 Минимальный пример:
 
@@ -396,6 +404,7 @@ name: "tcp-iso8583-xml-bpc"
 steps:
   - type: tcp_iso8583_xml
     tcp_addr: "127.0.0.1:9000"
+    tcp_pool_size: 20
     tcp_length_prefix: "4ascii"
     tcp_iso8583_spec_xml: "c:\\projects\\BPC8583POS.xml"
     tcp_iso8583_fields:
