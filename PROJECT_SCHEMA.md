@@ -53,6 +53,7 @@ gruzilla/
   - `scenarios` - CRUD for scenario YAML files;
   - `templates` - CRUD for template files.
 - For `run*` commands it sends JSON POST requests to executor API.
+- For `executors start/restart` it prefers local `gruzilla-executor` binary (`.exe` on Windows) and falls back to `go run ./cmd/gruzilla-executor` if binary is not found; `--bin` can override this behavior.
 
 ### `gruzilla-backend` (frontend facade)
 

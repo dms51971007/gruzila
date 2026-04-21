@@ -16,9 +16,17 @@
 
 Из корня проекта:
 
-```bash
+```powershell
 docker compose -f docker-compose.monitoring.yml up -d
 ```
+
+Если executor запускается через CLI, можно использовать:
+
+```powershell
+go run ./cmd/gruzilla-cli executors start --scenario "C:\projects\load\gruzilla\scenarios\mq-topic1-request-reply.yml" --addr ":8081"
+```
+
+CLI попытается запустить локальный `gruzilla-executor(.exe)`, и только если бинарь не найден — сделает fallback на `go run`.
 
 - **Prometheus:** http://localhost:9090  
 - **Grafana:** http://localhost:3000 (логин/пароль: admin / admin)

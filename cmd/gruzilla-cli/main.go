@@ -22,6 +22,51 @@ import (
 
 const defaultExecutorURL = "http://localhost:8081"
 
+func defaultExecutorBin() string {
+	for _, candidate := range executorExecutableCandidates() {
+		if pathExists(candidate) {
+			return candidate
+		}
+	}
+	return "go"
+}
+
+func executorExecutableCandidates() []string {
+	name := "gruzilla-executor"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	out := []string{name, filepath.Join("bin", name)}
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		out = append(out, filepath.Join(exeDir, name))
+	}
+	return uniqueNonEmptyPaths(out)
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func uniqueNonEmptyPaths(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		p := strings.TrimSpace(it)
+		if p == "" {
+			continue
+		}
+		key := strings.ToLower(filepath.Clean(p))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
 // varsFlag реализует кастомный парсер repeatable флага --var key=value.
 type varsFlag map[string]string
 
@@ -952,7 +997,7 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 
 	cmd.Flags().StringVar(&scenarioPath, "scenario", "", "path to .yml scenario file")
 	cmd.Flags().StringVar(&addr, "addr", ":8081", "listen address for executor (e.g. :8081)")
-	cmd.Flags().StringVar(&bin, "bin", "go", "executor binary or 'go' to use 'go run ./cmd/gruzilla-executor'")
+	cmd.Flags().StringVar(&bin, "bin", defaultExecutorBin(), "executor binary path (default: local gruzilla-executor[.exe], fallback: 'go')")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "optional path to executor log file")
 
 	return cmd
@@ -1016,7 +1061,7 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&scenarioPath, "scenario", "", "path to .yml scenario file")
 	cmd.Flags().StringVar(&addr, "addr", ":8081", "listen address for executor")
-	cmd.Flags().StringVar(&bin, "bin", "go", "executor binary or 'go' for go run")
+	cmd.Flags().StringVar(&bin, "bin", defaultExecutorBin(), "executor binary path (default: local gruzilla-executor[.exe], fallback: 'go')")
 	cmd.Flags().StringVar(&executorURL, "executor-url", "", "URL of running executor to shutdown (default http://localhost<addr>)")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "optional path to executor log file")
 	return cmd

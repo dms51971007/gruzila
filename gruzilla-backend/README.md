@@ -1,29 +1,29 @@
 # gruzilla-backend
 
-Backend facade for Gruzilla UI.
+Backend-фасад для UI Gruzilla.
 
-It accepts frontend `POST /api/v1/*` requests and executes `gruzilla-cli` commands.
-The backend does not call executor APIs directly.
+Принимает `POST /api/v1/*` от frontend и выполняет команды `gruzilla-cli`.
+Backend не вызывает API executor напрямую.
 
-## Run
+## Запуск
 
-From `C:\projects\load\gruzilla`:
+Из `C:\projects\load\gruzilla`:
 
 ```powershell
 go run ./gruzilla-backend
 ```
 
-Default listen address: `:8080`.
+Адрес прослушивания по умолчанию: `:8080`.
 
-Run with explicit config path:
+Запуск с явным путём к конфигу:
 
 ```powershell
 go run ./gruzilla-backend --config ".\config-backend.yml"
 ```
 
-Default config file: `config-backend.yml` in current working directory.
+Файл конфига по умолчанию: `config-backend.yml` в текущей рабочей директории.
 
-## Environment
+## Переменные окружения
 
 - `GRUZILLA_BACKEND_ADDR` (default `:8080`)
 - `GRUZILLA_BACKEND_CONFIG` (default `config-backend.yml`)
@@ -33,7 +33,7 @@ Default config file: `config-backend.yml` in current working directory.
 - `GRUZILLA_CLI_TIMEOUT_SECONDS` (default `30`)
 - `GRUZILLA_DEFAULT_EXECUTOR_URL` (default `http://localhost:8081`)
 
-Environment variables override values loaded from `config-backend.yml`.
+Переменные окружения имеют приоритет над значениями из `config-backend.yml`.
 
 ## Config file (`config-backend.yml`)
 
@@ -43,7 +43,16 @@ Environment variables override values loaded from `config-backend.yml`.
 - `cli.executor_logs_enabled` — при `true` и старте executor через API backend передаётся путь лог-файла.
 - `cli.executor_log_file` — шаблон пути (например `logs/executor-{addr}.log`); подстановка `{addr}` из адреса listen executor.
 
-## Run API bodies
+### Как backend стартует executor
+
+Backend вызывает `gruzilla-cli executors start/restart`. Если поле `bin` не передано в JSON-теле, CLI сам выбирает:
+
+1. бинарь `gruzilla-executor` (`.exe` на Windows) в типовых путях;
+2. fallback на `go run ./cmd/gruzilla-executor`, если бинарь не найден.
+
+Чтобы принудительно задать способ запуска, передайте `bin` в body (`"go"` или полный путь к `.exe`/binary).
+
+## JSON тела Run API
 
 Эндпоинты `POST /api/v1/run/start` и `POST /api/v1/run/update` принимают JSON:
 
@@ -54,9 +63,9 @@ Environment variables override values loaded from `config-backend.yml`.
 
 Ответ `run/status` проксирует вывод CLI; в данных статуса executor присутствует `scenario_has_load_schedule`, если в активном сценарии задано расписание нагрузки.
 
-## Request tracing
+## Трассировка запросов
 
-- Reads incoming header `X-Request-Id`.
-- If missing, generates UUID-like id.
-- Passes value to CLI via `--request-id`.
-- Returns `X-Request-Id` in response headers.
+- Читает входящий заголовок `X-Request-Id`.
+- Если заголовка нет — генерирует UUID-подобный идентификатор.
+- Пробрасывает значение в CLI через `--request-id`.
+- Возвращает `X-Request-Id` в заголовках ответа.

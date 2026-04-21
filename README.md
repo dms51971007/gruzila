@@ -330,11 +330,26 @@ go run ./cmd/gruzilla-cli run status --executor-url "http://localhost:8081"
 - `executors start` — старт нового процесса executor
 - `executors restart` — мягкий перезапуск (shutdown API + новый start)
 
+По умолчанию `executors start/restart` выбирают способ запуска так:
+
+1. пытаются найти бинарь `gruzilla-executor` (`gruzilla-executor.exe` на Windows) в:
+   - текущей директории;
+   - `bin/`;
+   - директории рядом с исполняемым файлом `gruzilla-cli`;
+2. если бинарь не найден — используют fallback `go run ./cmd/gruzilla-executor`.
+
+Явно переопределить можно флагом `--bin`:
+
+- `--bin "go"` — принудительно запускать через `go run`;
+- `--bin "C:\\path\\to\\gruzilla-executor.exe"` — запуск конкретного бинаря.
+
 Примеры:
 
 ```powershell
 go run ./cmd/gruzilla-cli executors start --scenario "C:\projects\load\gruzilla\scenarios\mq-topic1-request-reply.yml" --addr ":8081"
 go run ./cmd/gruzilla-cli executors restart --scenario "C:\projects\load\gruzilla\scenarios\mq-topic1-request-reply.yml" --addr ":8081" --executor-url "http://localhost:8081"
+# Явно через go run:
+go run ./cmd/gruzilla-cli executors start --scenario "C:\projects\load\gruzilla\scenarios\mq-topic1-request-reply.yml" --addr ":8081" --bin "go"
 ```
 
 ## Команды `gruzilla-cli scenarios` (CRUD YAML)

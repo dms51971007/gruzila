@@ -172,6 +172,7 @@
 - **Реализация**
   - **`run reset-metrics`** — вызов `POST /api/v1/reset_metrics` для обнуления счётчиков при остановленной нагрузке.
   - **`executors restart`** — отправка `POST /api/v1/shutdown` текущему процессу, ожидание ~2 с, запуск нового процесса executor с теми же `--scenario` и `--addr` (чтобы подхватить обновлённые исходники).
+  - Для `executors start/restart` CLI по умолчанию пытается запускать локальный бинарь `gruzilla-executor` (`.exe` на Windows) из типовых путей; если бинарь не найден, использует fallback `go run ./cmd/gruzilla-executor`.
   - Добавлен флаг `--log-file` для `gruzilla-executor`, `gruzilla-cli executors start/restart` и проброс через backend API:
     - позволяет писать runtime-логи executor в файл (включая MQ-логи сообщений/headers);
     - в backend добавлены дефолтные настройки `executor_logs_enabled` и `executor_log_file` (с шаблоном `{addr}`).
@@ -183,9 +184,9 @@
 - **ТЗ**
   - Отдельный README для конкретного сценария явно не требовался.
 - **Реализация**
-  - Добавлен файл `scenarios/mq-topic1-request-reply.README.md` с практическими командами:
+  - Практические команды и последовательности по Artemis request-reply описаны в корневом `README.md`:
     - запуск `gruzilla-executor` для сценария;
-    - все команды `gruzilla-cli run` и `gruzilla-cli executors` с примерами;
+    - команды `gruzilla-cli run` и `gruzilla-cli executors`;
     - типовые последовательности (start/update/status/stop/reload/reset).
 - **Отклонения**
   - Расширение ТЗ: операционная документация для упрощения запуска и диагностики.
