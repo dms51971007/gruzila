@@ -25,6 +25,9 @@ const defaultExecutorURL = "http://localhost:8081"
 func defaultExecutorBin() string {
 	for _, candidate := range executorExecutableCandidates() {
 		if pathExists(candidate) {
+			if abs, err := filepath.Abs(candidate); err == nil {
+				return abs
+			}
 			return candidate
 		}
 	}
