@@ -586,7 +586,7 @@ export default function ExecutorsPanel({
       const listenAddr = normalizeExecutorListenAddr(addr);
       const response = await postApi(
         "/api/v1/executors/start",
-        { scenario, addr: listenAddr, bin: "go" },
+        { scenario, addr: listenAddr },
         { baseUrl },
       );
       setLastResponse(response);
