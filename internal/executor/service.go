@@ -1400,6 +1400,7 @@ func transientArtemisGetErr(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "connection closed") ||
 		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "write channel closed") ||
 		strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "connection reset") ||
 		strings.Contains(s, "reset by peer") ||

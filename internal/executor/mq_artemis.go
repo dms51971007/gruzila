@@ -592,10 +592,12 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 	for {
 		select {
 		case <-timeout:
-			// Если подписка "подвисла" после сетевого разрыва, timeout сам по себе
-			// не обновит cached subscription. Принудительно инвалидируем кэши,
-			// чтобы следующая попытка заново подключилась к брокеру.
-			m.invalidateAllConns()
+			// Обычный timeout чтения не равен transport-error.
+			// Для селекторных одноразовых reply-подписок снимаем кеш подписи,
+			// чтобы не копить их между вызовами.
+			if strings.TrimSpace(selector) != "" {
+				m.releaseCachedSub(dest, selector)
+			}
 			return "", nil, fmt.Errorf("artemis get: no message within %v", wait)
 		case msg := <-sub.C:
 			if msg == nil {
@@ -614,7 +616,12 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 				headers,
 				len(msg.Body),
 			)
-			m.releaseCachedSub(dest, selector)
+			// Селекторные подписки (request-reply с уникальным RequestId) одноразовые.
+			// Для shared-подписок без selector не делаем Unsubscribe после каждого
+			// сообщения, иначе под конкуренцией получаем churn и ложные nil frame.
+			if strings.TrimSpace(selector) != "" {
+				m.releaseCachedSub(dest, selector)
+			}
 			return string(msg.Body), headers, nil
 		}
 	}
