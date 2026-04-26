@@ -7,7 +7,7 @@ steps:
     name: "put-request-to-topic1"
     mq_action: put
     queue: "topic_1"
-    mq_conn_name: "localhost:61613"          # Artemis STOMP endpoint (см. docker-compose)
+    mq_conn_name: "localhost:61616"
     mq_channel: ""
     mq_queue_manager: ""
     mq_user: "artemis"
@@ -28,7 +28,7 @@ steps:
     mq_action: get
     queue: "topic_2_"
     mq_selector: "X_ServiceID"
-    mq_conn_name: "localhost:61613"
+    mq_conn_name: "localhost:61616"
     mq_channel: ""
     mq_queue_manager: ""
     mq_user: "artemis"

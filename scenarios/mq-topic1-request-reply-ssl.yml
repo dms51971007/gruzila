@@ -14,7 +14,7 @@ steps:
     name: "get-reply-check-success"
     mq_action: get
     queue: "topic_2_"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_profile: "includes/mq-conn-ssl.yml"
     mq_wait_ms: 15000
     assert:

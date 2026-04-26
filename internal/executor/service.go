@@ -1314,7 +1314,7 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 		if waitMS <= 0 {
 			waitMS = 15000
 		}
-		selector := buildArtemisSelector(interpolate(vars, step.MQSelector), vars)
+		selector, oneShotSelector := buildArtemisSelector(interpolate(vars, step.MQSelector), vars)
 		timeout := time.Duration(waitMS) * time.Millisecond
 		deadline := time.Now().Add(timeout)
 		var lastMismatch string
@@ -1328,7 +1328,7 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 				return fmt.Errorf("mq get: no message within %v", timeout)
 			}
 
-			msg, _, err := cf.Get(queue, remaining, selector)
+			msg, _, err := cf.Get(queue, remaining, selector, oneShotSelector, strings.TrimSpace(vars["requestId"]))
 			if err != nil {
 				errStr := err.Error()
 				if strings.Contains(errStr, "no message within") {
@@ -1413,20 +1413,24 @@ func transientArtemisGetErr(err error) bool {
 // buildArtemisSelector готовит broker-side selector для SUBSCRIBE.
 // Если в mq_selector уже передано выражение (есть '='), используем как есть.
 // Иначе считаем, что это имя header-поля и строим выражение field = 'requestId'.
-func buildArtemisSelector(rawSelector string, vars map[string]string) string {
+func buildArtemisSelector(rawSelector string, vars map[string]string) (string, bool) {
 	s := strings.TrimSpace(rawSelector)
 	if s == "" {
-		return ""
+		return "", false
 	}
 	if strings.Contains(s, "=") {
-		return s
+		return s, false
 	}
 	selectorValue := selectorValueFromVars(s, vars)
 	if selectorValue == "" {
-		return ""
+		return "", false
 	}
 	escaped := strings.ReplaceAll(selectorValue, "'", "''")
-	return fmt.Sprintf("%s = '%s'", s, escaped)
+	oneShot := false
+	if reqID := strings.TrimSpace(vars["requestId"]); reqID != "" && selectorValue == reqID {
+		oneShot = true
+	}
+	return fmt.Sprintf("%s = '%s'", s, escaped), oneShot
 }
 
 func selectorValueFromVars(selectorField string, vars map[string]string) string {

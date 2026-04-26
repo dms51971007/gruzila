@@ -18,7 +18,7 @@ steps:
     name: "get-reply-step1"
     mq_action: get
     queue: "OUT.RS.TRNFFIRSCRGET_02.00.00"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_wait_ms: 15000
     assert:
@@ -38,7 +38,7 @@ steps:
     name: "get-reply-step2"
     mq_action: get
     queue: "OUT.RS.TRNFOPERCHECK_01.00.00"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_wait_ms: 15000
     extract:
@@ -59,7 +59,7 @@ steps:
     name: "get-reply-step3"
     mq_action: get
     queue: "OUT.RS.TRNFFNLSCRGET_01.00.00"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_wait_ms: 15000
     assert:
@@ -78,7 +78,7 @@ steps:
     name: "get-reply-step4"
     mq_action: get
     queue: "OUT.RS.TRNFOPEREXEC_01.00.00"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_wait_ms: 15000
     assert:
@@ -97,7 +97,7 @@ steps:
     name: "get-reply-step5"
     mq_action: get
     queue: "OUT.RS.SFPTRNFSTATGET_01.00.00"
-    mq_selector: "RequestId"
+    mq_selector: "X_ServiceID"
     mq_profile: "includes/mq-conn-no-ssl.yml"
     mq_wait_ms: 15000
     assert:

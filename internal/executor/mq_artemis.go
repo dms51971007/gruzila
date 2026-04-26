@@ -43,6 +43,16 @@ var artemisConnCache = struct {
 	conns: make(map[string]*stomp.Conn),
 }
 
+var artemisConnCreateMu sync.Mutex
+var artemisSubCreateMu sync.Mutex
+
+var artemisTLSConfigCache = struct {
+	mu      sync.Mutex
+	configs map[string]*tls.Config
+}{
+	configs: make(map[string]*tls.Config),
+}
+
 const artemisPutPoolSize = 16
 const artemisHeartbeat = 30 * time.Second
 
@@ -67,6 +77,28 @@ var artemisSubCache = struct {
 	subs map[string]*stomp.Subscription
 }{
 	subs: make(map[string]*stomp.Subscription),
+}
+
+var artemisSharedReaders = struct {
+	mu      sync.Mutex
+	readers map[string]*artemisSharedReader
+}{
+	readers: make(map[string]*artemisSharedReader),
+}
+
+type artemisSharedReader struct {
+	key     string
+	dest    string
+	sel     string
+	factory mqConnectionFactory
+
+	msgs chan *stomp.Message
+	stop chan struct{}
+	once sync.Once
+
+	mu      sync.Mutex
+	waiters map[string][]chan *stomp.Message
+	pending map[string][]*stomp.Message
 }
 
 // addr нормализует адрес подключения для STOMP dial.
@@ -99,7 +131,7 @@ func (m mqConnectionFactory) connect() (*stomp.Conn, error) {
 	dialer := net.Dialer{Timeout: artemisTCPDialTimeout}
 
 	if m.TLSEnabled {
-		tlsCfg, err := m.tlsConfig()
+		tlsCfg, err := m.getOrCreateTLSConfig()
 		if err != nil {
 			return nil, err
 		}
@@ -144,6 +176,34 @@ func (m mqConnectionFactory) connect() (*stomp.Conn, error) {
 		return nil, fmt.Errorf("artemis stomp connect (%s): %w", addr, err)
 	}
 	return stompConn, nil
+}
+
+func (m mqConnectionFactory) tlsConfigCacheKey() string {
+	return "tlscfg|" + m.connCacheKey()
+}
+
+func (m mqConnectionFactory) getOrCreateTLSConfig() (*tls.Config, error) {
+	key := m.tlsConfigCacheKey()
+	artemisTLSConfigCache.mu.Lock()
+	if cfg, ok := artemisTLSConfigCache.configs[key]; ok && cfg != nil {
+		artemisTLSConfigCache.mu.Unlock()
+		return cfg, nil
+	}
+	artemisTLSConfigCache.mu.Unlock()
+
+	cfg, err := m.tlsConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	artemisTLSConfigCache.mu.Lock()
+	if existing, ok := artemisTLSConfigCache.configs[key]; ok && existing != nil {
+		artemisTLSConfigCache.mu.Unlock()
+		return existing, nil
+	}
+	artemisTLSConfigCache.configs[key] = cfg
+	artemisTLSConfigCache.mu.Unlock()
+	return cfg, nil
 }
 
 func (m mqConnectionFactory) tlsConfig() (*tls.Config, error) {
@@ -336,6 +396,16 @@ func (m mqConnectionFactory) getOrCreateConn() (*stomp.Conn, error) {
 	}
 	artemisConnCache.mu.Unlock()
 
+	artemisConnCreateMu.Lock()
+	defer artemisConnCreateMu.Unlock()
+
+	artemisConnCache.mu.Lock()
+	if conn, ok := artemisConnCache.conns[key]; ok && conn != nil {
+		artemisConnCache.mu.Unlock()
+		return conn, nil
+	}
+	artemisConnCache.mu.Unlock()
+
 	conn, err := m.connect()
 	if err != nil {
 		return nil, err
@@ -412,6 +482,232 @@ func stompTeardown(c *stomp.Conn) {
 	}
 }
 
+func (m mqConnectionFactory) sharedReaderKey(dest, selector string) string {
+	return m.subCacheKey(dest, selector)
+}
+
+func (m mqConnectionFactory) getOrCreateSharedReader(dest, selector string) (*artemisSharedReader, error) {
+	key := m.sharedReaderKey(dest, selector)
+
+	artemisSharedReaders.mu.Lock()
+	if r, ok := artemisSharedReaders.readers[key]; ok && r != nil {
+		artemisSharedReaders.mu.Unlock()
+		return r, nil
+	}
+	artemisSharedReaders.mu.Unlock()
+
+	r := &artemisSharedReader{
+		key:     key,
+		dest:    dest,
+		sel:     strings.TrimSpace(selector),
+		factory: m,
+		msgs:    make(chan *stomp.Message, 4096),
+		stop:    make(chan struct{}),
+		waiters: make(map[string][]chan *stomp.Message),
+		pending: make(map[string][]*stomp.Message),
+	}
+	go r.run()
+
+	artemisSharedReaders.mu.Lock()
+	if existing, ok := artemisSharedReaders.readers[key]; ok && existing != nil {
+		artemisSharedReaders.mu.Unlock()
+		r.close()
+		return existing, nil
+	}
+	artemisSharedReaders.readers[key] = r
+	artemisSharedReaders.mu.Unlock()
+	return r, nil
+}
+
+func (r *artemisSharedReader) close() {
+	r.once.Do(func() {
+		close(r.stop)
+		r.mu.Lock()
+		for reqID, ws := range r.waiters {
+			for _, ch := range ws {
+				close(ch)
+			}
+			delete(r.waiters, reqID)
+		}
+		r.pending = make(map[string][]*stomp.Message)
+		r.mu.Unlock()
+	})
+}
+
+func (r *artemisSharedReader) waitForRequestID(requestID string, wait time.Duration) (*stomp.Message, error) {
+	reqID := strings.TrimSpace(requestID)
+	if reqID == "" {
+		return nil, fmt.Errorf("empty request id")
+	}
+
+	replyCh := make(chan *stomp.Message, 1)
+	r.mu.Lock()
+	if pending := r.pending[reqID]; len(pending) > 0 {
+		msg := pending[0]
+		if len(pending) == 1 {
+			delete(r.pending, reqID)
+		} else {
+			r.pending[reqID] = pending[1:]
+		}
+		r.mu.Unlock()
+		return msg, nil
+	}
+	r.waiters[reqID] = append(r.waiters[reqID], replyCh)
+	r.mu.Unlock()
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-r.stop:
+		r.removeWaiter(reqID, replyCh)
+		return nil, fmt.Errorf("artemis shared reader stopped")
+	case <-timer.C:
+		r.removeWaiter(reqID, replyCh)
+		return nil, fmt.Errorf("artemis get: no message within %v", wait)
+	case msg, ok := <-replyCh:
+		if !ok {
+			return nil, fmt.Errorf("artemis shared reader closed")
+		}
+		if msg == nil {
+			return nil, fmt.Errorf("artemis get: nil frame")
+		}
+		return msg, nil
+	}
+}
+
+func (r *artemisSharedReader) removeWaiter(reqID string, target chan *stomp.Message) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ws := r.waiters[reqID]
+	if len(ws) == 0 {
+		return
+	}
+	for i := range ws {
+		if ws[i] == target {
+			ws = append(ws[:i], ws[i+1:]...)
+			break
+		}
+	}
+	if len(ws) == 0 {
+		delete(r.waiters, reqID)
+		return
+	}
+	r.waiters[reqID] = ws
+}
+
+func artemisMsgRequestID(msg *stomp.Message) string {
+	if msg == nil || msg.Header == nil {
+		return ""
+	}
+	keys := []string{"RequestId", "requestId", "RequestID", "requestID"}
+	for _, k := range keys {
+		if v, ok := msg.Header.Contains(k); ok {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func (r *artemisSharedReader) dispatch(msg *stomp.Message) bool {
+	reqID := artemisMsgRequestID(msg)
+	if reqID == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ws := r.waiters[reqID]; len(ws) > 0 {
+		ch := ws[0]
+		if len(ws) == 1 {
+			delete(r.waiters, reqID)
+		} else {
+			r.waiters[reqID] = ws[1:]
+		}
+		ch <- msg
+		return true
+	}
+	pending := r.pending[reqID]
+	if len(pending) >= 8 {
+		pending = pending[1:]
+	}
+	r.pending[reqID] = append(pending, msg)
+	return true
+}
+
+func (r *artemisSharedReader) run() {
+	for {
+		select {
+		case <-r.stop:
+			return
+		default:
+		}
+
+		conn, err := r.factory.connect()
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		var sub *stomp.Subscription
+		if r.sel != "" {
+			sub, err = conn.Subscribe(r.dest, stomp.AckAuto, stomp.SubscribeOpt.Header("selector", r.sel))
+		} else {
+			sub, err = conn.Subscribe(r.dest, stomp.AckAuto)
+		}
+		if err != nil {
+			stompTeardown(conn)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		for {
+			select {
+			case <-r.stop:
+				if sub != nil && sub.Active() {
+					_ = sub.Unsubscribe()
+				}
+				stompTeardown(conn)
+				return
+			case msg, ok := <-sub.C:
+				if !ok || msg == nil {
+					if sub != nil && sub.Active() {
+						_ = sub.Unsubscribe()
+					}
+					stompTeardown(conn)
+					time.Sleep(100 * time.Millisecond)
+					goto reconnect
+				}
+				if msg.Err != nil {
+					if sub != nil && sub.Active() {
+						_ = sub.Unsubscribe()
+					}
+					stompTeardown(conn)
+					time.Sleep(100 * time.Millisecond)
+					goto reconnect
+				}
+				if r.dispatch(msg) {
+					continue
+				}
+				select {
+				case r.msgs <- msg:
+				case <-r.stop:
+					if sub != nil && sub.Active() {
+						_ = sub.Unsubscribe()
+					}
+					stompTeardown(conn)
+					return
+				}
+			}
+		}
+	reconnect:
+		continue
+	}
+}
+
 // invalidateAllConns полностью сбрасывает все кэши соединений/подписок
 // для конкретного mqConnectionFactory.
 func (m mqConnectionFactory) invalidateAllConns() {
@@ -434,6 +730,10 @@ func (m mqConnectionFactory) invalidateAllConns() {
 	}
 	artemisPutConnPool.mu.Unlock()
 
+	artemisTLSConfigCache.mu.Lock()
+	delete(artemisTLSConfigCache.configs, m.tlsConfigCacheKey())
+	artemisTLSConfigCache.mu.Unlock()
+
 	prefix := key + "|"
 	artemisSubCache.mu.Lock()
 	for subKey := range artemisSubCache.subs {
@@ -443,7 +743,71 @@ func (m mqConnectionFactory) invalidateAllConns() {
 	}
 	artemisSubCache.mu.Unlock()
 
+	artemisSharedReaders.mu.Lock()
+	for readerKey, r := range artemisSharedReaders.readers {
+		if strings.HasPrefix(readerKey, key+"|") {
+			delete(artemisSharedReaders.readers, readerKey)
+			if r != nil {
+				r.close()
+			}
+		}
+	}
+	artemisSharedReaders.mu.Unlock()
+
 	stompTeardown(shared)
+	for _, c := range pooled {
+		stompTeardown(c)
+	}
+}
+
+// invalidateReadConn сбрасывает только shared read-connection и sub cache.
+func (m mqConnectionFactory) invalidateReadConn() {
+	key := m.connCacheKey()
+	var shared *stomp.Conn
+
+	artemisConnCache.mu.Lock()
+	if conn, ok := artemisConnCache.conns[key]; ok && conn != nil {
+		delete(artemisConnCache.conns, key)
+		shared = conn
+	}
+	artemisConnCache.mu.Unlock()
+
+	prefix := key + "|"
+	artemisSubCache.mu.Lock()
+	for subKey := range artemisSubCache.subs {
+		if strings.HasPrefix(subKey, prefix) {
+			delete(artemisSubCache.subs, subKey)
+		}
+	}
+	artemisSubCache.mu.Unlock()
+
+	artemisSharedReaders.mu.Lock()
+	for readerKey, r := range artemisSharedReaders.readers {
+		if strings.HasPrefix(readerKey, key+"|") {
+			delete(artemisSharedReaders.readers, readerKey)
+			if r != nil {
+				r.close()
+			}
+		}
+	}
+	artemisSharedReaders.mu.Unlock()
+
+	stompTeardown(shared)
+}
+
+// invalidatePutConns сбрасывает только write-side пул.
+func (m mqConnectionFactory) invalidatePutConns() {
+	key := m.connCacheKey()
+	var pooled []*stomp.Conn
+
+	artemisPutConnPool.mu.Lock()
+	if conns, ok := artemisPutConnPool.pool[key]; ok {
+		pooled = append([]*stomp.Conn(nil), conns...)
+		delete(artemisPutConnPool.pool, key)
+		delete(artemisPutConnPool.rr, key)
+	}
+	artemisPutConnPool.mu.Unlock()
+
 	for _, c := range pooled {
 		stompTeardown(c)
 	}
@@ -472,11 +836,33 @@ func (m mqConnectionFactory) releaseCachedSub(dest string, selector string) {
 	}
 }
 
+// dropCachedSubOnly удаляет sub из кэша без broker-side UNSUBSCRIBE.
+// Нужен для shared-selector путей (например X_ServiceID) на transport-ошибках.
+func (m mqConnectionFactory) dropCachedSubOnly(dest string, selector string) {
+	key := m.subCacheKey(dest, selector)
+	artemisSubCache.mu.Lock()
+	delete(artemisSubCache.subs, key)
+	artemisSubCache.mu.Unlock()
+}
+
 // getOrCreateSub возвращает кэшированную подписку для destination+selector.
 // Для одинакового selector внутри executor переиспользуется один listener.
 func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stomp.Subscription, error) {
 	key := m.subCacheKey(dest, selector)
 	selector = strings.TrimSpace(selector)
+
+	artemisSubCache.mu.Lock()
+	if sub, ok := artemisSubCache.subs[key]; ok && sub != nil {
+		if sub.Active() {
+			artemisSubCache.mu.Unlock()
+			return sub, nil
+		}
+		delete(artemisSubCache.subs, key)
+	}
+	artemisSubCache.mu.Unlock()
+
+	artemisSubCreateMu.Lock()
+	defer artemisSubCreateMu.Unlock()
 
 	artemisSubCache.mu.Lock()
 	if sub, ok := artemisSubCache.subs[key]; ok && sub != nil {
@@ -500,8 +886,9 @@ func (m mqConnectionFactory) getOrCreateSub(dest string, selector string) (*stom
 		sub, err = conn.Subscribe(dest, stomp.AckAuto)
 	}
 	if err != nil {
-		// Полный сброс: read-conn и PUT-пул, иначе после сбоя shared остаются мёртвые сокеты в пуле.
-		m.invalidateAllConns()
+		// Важно: не рвём shared read-conn здесь. Под конкуренцией массовый teardown
+		// запускает reconnect-storm и дополнительный churn на broker-side.
+		// Ошибку отдаём вызывающему коду, который уже делает retry в пределах дедлайна.
 		if selector != "" {
 			return nil, fmt.Errorf("artemis subscribe %s with selector %q: %w", dest, selector, err)
 		}
@@ -564,9 +951,8 @@ func (m mqConnectionFactory) Put(queueName string, payload string, headers map[s
 	}
 	opts = append(opts, stomp.SendOpt.NoContentLength)
 	if err := conn.Send(dest, "application/json", []byte(payload), opts...); err != nil {
-		// После потери брокера часто деградируют сразу несколько pooled-сокетов.
-		// Сбрасываем все кэши этого endpoint, чтобы следующий вызов делал чистый reconnect.
-		m.invalidateAllConns()
+		// PUT-ошибка: сбрасываем write-side пул, read-side не трогаем.
+		m.invalidatePutConns()
 		log.Printf("[mq] send error destination=%s err=%v", dest, err)
 		return fmt.Errorf("artemis send to %s: %w", dest, err)
 	}
@@ -577,10 +963,41 @@ func (m mqConnectionFactory) Put(queueName string, payload string, headers map[s
 // Get ждёт сообщение из destination до указанного timeout.
 // Возвращает body и headers полученного сообщения.
 // На transport/subscription ошибках сбрасывает кэши для последующего reconnect.
-func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector string) (string, map[string]string, error) {
+func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector string, oneShotSelector bool, expectedRequestID string) (string, map[string]string, error) {
 	dest := m.destination(queueName)
 	if dest == "" {
 		return "", nil, fmt.Errorf("empty artemis destination")
+	}
+
+	// Shared selector (например X_ServiceID): читаем через один долгоживущий
+	// reader на executor, чтобы исключить конкурентное чтение sub.C сотнями воркеров.
+	if strings.TrimSpace(selector) != "" && !oneShotSelector {
+		reader, err := m.getOrCreateSharedReader(dest, selector)
+		if err != nil {
+			return "", nil, err
+		}
+		if strings.TrimSpace(expectedRequestID) != "" {
+			msg, err := reader.waitForRequestID(expectedRequestID, wait)
+			if err != nil {
+				return "", nil, err
+			}
+			headers := stompHeaderToMap(msg.Header)
+			return string(msg.Body), headers, nil
+		}
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		for {
+			select {
+			case <-timer.C:
+				return "", nil, fmt.Errorf("artemis get: no message within %v", wait)
+			case msg := <-reader.msgs:
+				if msg == nil {
+					continue
+				}
+				headers := stompHeaderToMap(msg.Header)
+				return string(msg.Body), headers, nil
+			}
+		}
 	}
 
 	sub, err := m.getOrCreateSub(dest, selector)
@@ -595,19 +1012,35 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 			// Обычный timeout чтения не равен transport-error.
 			// Для селекторных одноразовых reply-подписок снимаем кеш подписи,
 			// чтобы не копить их между вызовами.
-			if strings.TrimSpace(selector) != "" {
+			if oneShotSelector {
 				m.releaseCachedSub(dest, selector)
 			}
 			return "", nil, fmt.Errorf("artemis get: no message within %v", wait)
 		case msg := <-sub.C:
 			if msg == nil {
-				// Subscription channel closed: drop caches and reconnect path on next call.
-				m.invalidateAllConns()
+				// Subscription channel closed: сбрасываем только sub cache и пробуем
+				// пересоздать подписку в рамках этого же Get без немедленного teardown shared conn.
+				if oneShotSelector {
+					m.releaseCachedSub(dest, selector)
+				}
+				if wait > 200*time.Millisecond {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
 				return "", nil, fmt.Errorf("artemis get: nil frame")
 			}
 			if msg.Err != nil {
-				m.invalidateAllConns()
-				return "", nil, fmt.Errorf("artemis get frame error: %w", msg.Err)
+				// Аналогично nil frame: не рвём shared conn заранее, иначе при
+				// конкурентных Get получаем reconnect-storm и лавину Subscription N.
+				if oneShotSelector {
+					m.releaseCachedSub(dest, selector)
+				}
+				err := fmt.Errorf("artemis get frame error: %w", msg.Err)
+				if transientArtemisGetErr(err) && wait > 200*time.Millisecond {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				return "", nil, err
 			}
 			headers := stompHeaderToMap(msg.Header)
 			log.Printf(
@@ -619,7 +1052,7 @@ func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector 
 			// Селекторные подписки (request-reply с уникальным RequestId) одноразовые.
 			// Для shared-подписок без selector не делаем Unsubscribe после каждого
 			// сообщения, иначе под конкуренцией получаем churn и ложные nil frame.
-			if strings.TrimSpace(selector) != "" {
+			if oneShotSelector {
 				m.releaseCachedSub(dest, selector)
 			}
 			return string(msg.Body), headers, nil

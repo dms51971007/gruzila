@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  artemis:
+    image: quay.io/artemiscloud/activemq-artemis-broker:latest
+    container_name: kafka-db-sink-artemis
+    ports:
+      - "8161:8161"   # web console
+      - "61616:61616" # core/openwire/amqp/stomp
+      - "61613:61613" # STOMP over SSL
+      - "61614:61614" # STOMP plain (no SSL)
+    environment:
+      AMQ_USER: artemis
+      AMQ_PASSWORD: artemis
+    volumes:
+      - ./tmp-broker.xml:/home/jboss/broker/etc/broker.xml:ro
+      - ./certs/broker-keystore.p12:/home/jboss/broker/etc/broker-keystore.p12:ro
+      - ./certs/truststore.p12:/home/jboss/broker/etc/truststore.p12:ro
+      - artemis_data:/home/jboss/broker/data
+
+volumes:
+  artemis_data:
