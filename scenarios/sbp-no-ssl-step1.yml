@@ -1,0 +1,26 @@
+# SBP: цепочка MQ request-reply через Artemis STOMP без TLS
+name: "sbp-no-ssl"
+description: "SBP flow: несколько IN/OUT очередей"
+
+load_schedule_profile: "includes/load-schedule-sbp.yml"
+
+steps:
+
+  - type: mq
+    name: "put-request-step1"
+    mq_action: put
+    queue: "IN.RQ.TRNFFIRSCRGET_02.00.00"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_headers_profile: "includes/mq-headers-executorid.yml"
+    template: "SBP_step1.json.tmpl"
+
+  - type: mq
+    name: "get-reply-step1"
+    mq_action: get
+    queue: "OUT.RS.TRNFFIRSCRGET_02.00.00"
+    mq_selector: "RequestID"
+    mq_profile: "includes/mq-conn-no-ssl.yml"
+    mq_wait_ms: 15000
+    assert:
+      success_field: "status"
+      success: "success"

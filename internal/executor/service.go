@@ -1328,7 +1328,7 @@ func (r *runner) executeMQ(step scenario.Step, vars map[string]string) error {
 				return fmt.Errorf("mq get: no message within %v", timeout)
 			}
 
-			msg, _, err := cf.Get(queue, remaining, selector, oneShotSelector, strings.TrimSpace(vars["requestId"]))
+			msg, _, err := cf.Get(queue, remaining, selector, oneShotSelector)
 			if err != nil {
 				errStr := err.Error()
 				if strings.Contains(errStr, "no message within") {
@@ -1452,23 +1452,10 @@ func selectorValueFromVars(selectorField string, vars map[string]string) string 
 	return ""
 }
 
-// matchesMQAssert сверяет текстовые поля корреляции (requestId/clientGuid).
-// Предусмотрены разные варианты регистра ключа RequestID в payload.
+// matchesMQAssert сверяет дополнительные текстовые поля assert.
+// Проверка RequestID/requestId на этапе receive отключена.
 func matchesMQAssert(payload map[string]any, assert map[string]any) (bool, string) {
-	// requestId / clientGuid точное сравнение строк
-	if wantReqID, ok := assert["requestId"].(string); ok && wantReqID != "" {
-		gotRaw, ok2 := payload["RequestID"]
-		if !ok2 {
-			gotRaw, ok2 = payload["requestID"]
-		}
-		if !ok2 {
-			gotRaw, ok2 = payload["requestId"]
-		}
-		got, ok3 := gotRaw.(string)
-		if !ok3 || got != wantReqID {
-			return false, fmt.Sprintf("RequestID=%q, want %q", got, wantReqID)
-		}
-	}
+	// clientGuid точное сравнение строк (если явно задан в assert)
 	if wantClient, ok := assert["clientGuid"].(string); ok && wantClient != "" {
 		got, ok2 := payload["clientGuid"].(string)
 		if !ok2 || got != wantClient {
@@ -1493,7 +1480,7 @@ func checkMQSuccessAssert(payload map[string]any, assert map[string]any) (bool, 
 	if v, ok := assert["success_field"].(string); ok && v != "" {
 		successFieldName = v
 	}
-	got, ok := payload[successFieldName]
+	got, ok := mqAssertFieldValue(payload, successFieldName)
 	if !ok || !jsonEqual(got, successExpected) {
 		return false, fmt.Sprintf("%s=%v, want %v", successFieldName, got, successExpected)
 	}
@@ -1513,8 +1500,28 @@ func mqSuccessAssertFieldPresent(payload map[string]any, assert map[string]any) 
 	if v, ok := assert["success_field"].(string); ok && v != "" {
 		successFieldName = v
 	}
-	_, has := payload[successFieldName]
+	_, has := mqAssertFieldValue(payload, successFieldName)
 	return has
+}
+
+// mqAssertFieldValue читает поле success_field из payload.
+// Поддерживает как "плоский" ключ, так и путь через точку (например "resp.code").
+func mqAssertFieldValue(payload map[string]any, field string) (any, bool) {
+	name := strings.TrimSpace(field)
+	if name == "" {
+		return nil, false
+	}
+	if v, ok := payload[name]; ok {
+		return v, true
+	}
+	if !strings.Contains(name, ".") {
+		return nil, false
+	}
+	v, err := extractJSONPathValue(payload, name)
+	if err != nil {
+		return nil, false
+	}
+	return v, true
 }
 
 // buildMQSelectorFromAssert строит broker-selector из assert-полей.
@@ -1526,10 +1533,6 @@ func buildMQSelectorFromAssert(assert map[string]any) string {
 	var parts []string
 	if wantClient, ok := assert["clientGuid"].(string); ok && wantClient != "" {
 		parts = append(parts, "clientGuid = '"+escapeSelectorString(wantClient)+"'")
-	}
-	if wantReqID, ok := assert["requestId"].(string); ok && wantReqID != "" {
-		escaped := escapeSelectorString(wantReqID)
-		parts = append(parts, "(requestId = '"+escaped+"' OR requestID = '"+escaped+"' OR RequestID = '"+escaped+"')")
 	}
 	return strings.Join(parts, " AND ")
 }

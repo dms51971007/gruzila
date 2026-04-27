@@ -79,28 +79,6 @@ var artemisSubCache = struct {
 	subs: make(map[string]*stomp.Subscription),
 }
 
-var artemisSharedReaders = struct {
-	mu      sync.Mutex
-	readers map[string]*artemisSharedReader
-}{
-	readers: make(map[string]*artemisSharedReader),
-}
-
-type artemisSharedReader struct {
-	key     string
-	dest    string
-	sel     string
-	factory mqConnectionFactory
-
-	msgs chan *stomp.Message
-	stop chan struct{}
-	once sync.Once
-
-	mu      sync.Mutex
-	waiters map[string][]chan *stomp.Message
-	pending map[string][]*stomp.Message
-}
-
 // addr нормализует адрес подключения для STOMP dial.
 // Поддерживается legacy-формат "host(port)" и обычный "host:port".
 func (m mqConnectionFactory) addr() string {
@@ -482,232 +460,6 @@ func stompTeardown(c *stomp.Conn) {
 	}
 }
 
-func (m mqConnectionFactory) sharedReaderKey(dest, selector string) string {
-	return m.subCacheKey(dest, selector)
-}
-
-func (m mqConnectionFactory) getOrCreateSharedReader(dest, selector string) (*artemisSharedReader, error) {
-	key := m.sharedReaderKey(dest, selector)
-
-	artemisSharedReaders.mu.Lock()
-	if r, ok := artemisSharedReaders.readers[key]; ok && r != nil {
-		artemisSharedReaders.mu.Unlock()
-		return r, nil
-	}
-	artemisSharedReaders.mu.Unlock()
-
-	r := &artemisSharedReader{
-		key:     key,
-		dest:    dest,
-		sel:     strings.TrimSpace(selector),
-		factory: m,
-		msgs:    make(chan *stomp.Message, 4096),
-		stop:    make(chan struct{}),
-		waiters: make(map[string][]chan *stomp.Message),
-		pending: make(map[string][]*stomp.Message),
-	}
-	go r.run()
-
-	artemisSharedReaders.mu.Lock()
-	if existing, ok := artemisSharedReaders.readers[key]; ok && existing != nil {
-		artemisSharedReaders.mu.Unlock()
-		r.close()
-		return existing, nil
-	}
-	artemisSharedReaders.readers[key] = r
-	artemisSharedReaders.mu.Unlock()
-	return r, nil
-}
-
-func (r *artemisSharedReader) close() {
-	r.once.Do(func() {
-		close(r.stop)
-		r.mu.Lock()
-		for reqID, ws := range r.waiters {
-			for _, ch := range ws {
-				close(ch)
-			}
-			delete(r.waiters, reqID)
-		}
-		r.pending = make(map[string][]*stomp.Message)
-		r.mu.Unlock()
-	})
-}
-
-func (r *artemisSharedReader) waitForRequestID(requestID string, wait time.Duration) (*stomp.Message, error) {
-	reqID := strings.TrimSpace(requestID)
-	if reqID == "" {
-		return nil, fmt.Errorf("empty request id")
-	}
-
-	replyCh := make(chan *stomp.Message, 1)
-	r.mu.Lock()
-	if pending := r.pending[reqID]; len(pending) > 0 {
-		msg := pending[0]
-		if len(pending) == 1 {
-			delete(r.pending, reqID)
-		} else {
-			r.pending[reqID] = pending[1:]
-		}
-		r.mu.Unlock()
-		return msg, nil
-	}
-	r.waiters[reqID] = append(r.waiters[reqID], replyCh)
-	r.mu.Unlock()
-
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-
-	select {
-	case <-r.stop:
-		r.removeWaiter(reqID, replyCh)
-		return nil, fmt.Errorf("artemis shared reader stopped")
-	case <-timer.C:
-		r.removeWaiter(reqID, replyCh)
-		return nil, fmt.Errorf("artemis get: no message within %v", wait)
-	case msg, ok := <-replyCh:
-		if !ok {
-			return nil, fmt.Errorf("artemis shared reader closed")
-		}
-		if msg == nil {
-			return nil, fmt.Errorf("artemis get: nil frame")
-		}
-		return msg, nil
-	}
-}
-
-func (r *artemisSharedReader) removeWaiter(reqID string, target chan *stomp.Message) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ws := r.waiters[reqID]
-	if len(ws) == 0 {
-		return
-	}
-	for i := range ws {
-		if ws[i] == target {
-			ws = append(ws[:i], ws[i+1:]...)
-			break
-		}
-	}
-	if len(ws) == 0 {
-		delete(r.waiters, reqID)
-		return
-	}
-	r.waiters[reqID] = ws
-}
-
-func artemisMsgRequestID(msg *stomp.Message) string {
-	if msg == nil || msg.Header == nil {
-		return ""
-	}
-	keys := []string{"RequestId", "requestId", "RequestID", "requestID"}
-	for _, k := range keys {
-		if v, ok := msg.Header.Contains(k); ok {
-			v = strings.TrimSpace(v)
-			if v != "" {
-				return v
-			}
-		}
-	}
-	return ""
-}
-
-func (r *artemisSharedReader) dispatch(msg *stomp.Message) bool {
-	reqID := artemisMsgRequestID(msg)
-	if reqID == "" {
-		return false
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if ws := r.waiters[reqID]; len(ws) > 0 {
-		ch := ws[0]
-		if len(ws) == 1 {
-			delete(r.waiters, reqID)
-		} else {
-			r.waiters[reqID] = ws[1:]
-		}
-		ch <- msg
-		return true
-	}
-	pending := r.pending[reqID]
-	if len(pending) >= 8 {
-		pending = pending[1:]
-	}
-	r.pending[reqID] = append(pending, msg)
-	return true
-}
-
-func (r *artemisSharedReader) run() {
-	for {
-		select {
-		case <-r.stop:
-			return
-		default:
-		}
-
-		conn, err := r.factory.connect()
-		if err != nil {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-
-		var sub *stomp.Subscription
-		if r.sel != "" {
-			sub, err = conn.Subscribe(r.dest, stomp.AckAuto, stomp.SubscribeOpt.Header("selector", r.sel))
-		} else {
-			sub, err = conn.Subscribe(r.dest, stomp.AckAuto)
-		}
-		if err != nil {
-			stompTeardown(conn)
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-
-		for {
-			select {
-			case <-r.stop:
-				if sub != nil && sub.Active() {
-					_ = sub.Unsubscribe()
-				}
-				stompTeardown(conn)
-				return
-			case msg, ok := <-sub.C:
-				if !ok || msg == nil {
-					if sub != nil && sub.Active() {
-						_ = sub.Unsubscribe()
-					}
-					stompTeardown(conn)
-					time.Sleep(100 * time.Millisecond)
-					goto reconnect
-				}
-				if msg.Err != nil {
-					if sub != nil && sub.Active() {
-						_ = sub.Unsubscribe()
-					}
-					stompTeardown(conn)
-					time.Sleep(100 * time.Millisecond)
-					goto reconnect
-				}
-				if r.dispatch(msg) {
-					continue
-				}
-				select {
-				case r.msgs <- msg:
-				case <-r.stop:
-					if sub != nil && sub.Active() {
-						_ = sub.Unsubscribe()
-					}
-					stompTeardown(conn)
-					return
-				}
-			}
-		}
-	reconnect:
-		continue
-	}
-}
-
 // invalidateAllConns полностью сбрасывает все кэши соединений/подписок
 // для конкретного mqConnectionFactory.
 func (m mqConnectionFactory) invalidateAllConns() {
@@ -743,17 +495,6 @@ func (m mqConnectionFactory) invalidateAllConns() {
 	}
 	artemisSubCache.mu.Unlock()
 
-	artemisSharedReaders.mu.Lock()
-	for readerKey, r := range artemisSharedReaders.readers {
-		if strings.HasPrefix(readerKey, key+"|") {
-			delete(artemisSharedReaders.readers, readerKey)
-			if r != nil {
-				r.close()
-			}
-		}
-	}
-	artemisSharedReaders.mu.Unlock()
-
 	stompTeardown(shared)
 	for _, c := range pooled {
 		stompTeardown(c)
@@ -780,17 +521,6 @@ func (m mqConnectionFactory) invalidateReadConn() {
 		}
 	}
 	artemisSubCache.mu.Unlock()
-
-	artemisSharedReaders.mu.Lock()
-	for readerKey, r := range artemisSharedReaders.readers {
-		if strings.HasPrefix(readerKey, key+"|") {
-			delete(artemisSharedReaders.readers, readerKey)
-			if r != nil {
-				r.close()
-			}
-		}
-	}
-	artemisSharedReaders.mu.Unlock()
 
 	stompTeardown(shared)
 }
@@ -963,41 +693,10 @@ func (m mqConnectionFactory) Put(queueName string, payload string, headers map[s
 // Get ждёт сообщение из destination до указанного timeout.
 // Возвращает body и headers полученного сообщения.
 // На transport/subscription ошибках сбрасывает кэши для последующего reconnect.
-func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector string, oneShotSelector bool, expectedRequestID string) (string, map[string]string, error) {
+func (m mqConnectionFactory) Get(queueName string, wait time.Duration, selector string, oneShotSelector bool) (string, map[string]string, error) {
 	dest := m.destination(queueName)
 	if dest == "" {
 		return "", nil, fmt.Errorf("empty artemis destination")
-	}
-
-	// Shared selector (например X_ServiceID): читаем через один долгоживущий
-	// reader на executor, чтобы исключить конкурентное чтение sub.C сотнями воркеров.
-	if strings.TrimSpace(selector) != "" && !oneShotSelector {
-		reader, err := m.getOrCreateSharedReader(dest, selector)
-		if err != nil {
-			return "", nil, err
-		}
-		if strings.TrimSpace(expectedRequestID) != "" {
-			msg, err := reader.waitForRequestID(expectedRequestID, wait)
-			if err != nil {
-				return "", nil, err
-			}
-			headers := stompHeaderToMap(msg.Header)
-			return string(msg.Body), headers, nil
-		}
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-		for {
-			select {
-			case <-timer.C:
-				return "", nil, fmt.Errorf("artemis get: no message within %v", wait)
-			case msg := <-reader.msgs:
-				if msg == nil {
-					continue
-				}
-				headers := stompHeaderToMap(msg.Header)
-				return string(msg.Body), headers, nil
-			}
-		}
 	}
 
 	sub, err := m.getOrCreateSub(dest, selector)

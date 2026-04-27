@@ -8,5 +8,5 @@ mq_headers:
   X_Custom_Env: "serviceEnv"
   # Уникально на каждую итерацию — иначе при TPS>1 все воркеры делят один STOMP-селектор
   # и «зависают» на mq get; success_count/error_count не растут.
-  RequestId: "{requestId}"
+  RequestID: "service-{executorId}"
   X_MsgId: "{requestId}"
