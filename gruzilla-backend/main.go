@@ -33,6 +33,9 @@ type config struct {
 	DefaultExecutorURL  string
 	ExecutorLogsEnabled bool
 	ExecutorLogFile     string
+	ExecutorLogMaxSize  int
+	ExecutorLogBackups  int
+	ExecutorLogMaxAge   int
 }
 
 type fileConfig struct {
@@ -46,6 +49,9 @@ type fileConfig struct {
 		DefaultExecutorURL  string   `yaml:"default_executor_url"`
 		ExecutorLogsEnabled *bool    `yaml:"executor_logs_enabled"`
 		ExecutorLogFile     string   `yaml:"executor_log_file"`
+		ExecutorLogMaxSize  *int     `yaml:"executor_log_max_size_mb"`
+		ExecutorLogBackups  *int     `yaml:"executor_log_max_backups"`
+		ExecutorLogMaxAge   *int     `yaml:"executor_log_max_age_days"`
 	} `yaml:"cli"`
 }
 
@@ -137,6 +143,9 @@ func loadConfig(configPath string) config {
 		DefaultExecutorURL:  "http://localhost:8081",
 		ExecutorLogsEnabled: false,
 		ExecutorLogFile:     "logs/executor-{addr}.log",
+		ExecutorLogMaxSize:  50,
+		ExecutorLogBackups:  5,
+		ExecutorLogMaxAge:   14,
 	}
 
 	// Optional config YAML.
@@ -176,11 +185,20 @@ func loadConfig(configPath string) config {
 	if v := strings.TrimSpace(os.Getenv("GRUZILLA_EXECUTOR_LOG_FILE")); v != "" {
 		cfg.ExecutorLogFile = v
 	}
+	if v := strings.TrimSpace(os.Getenv("GRUZILLA_EXECUTOR_LOG_MAX_SIZE_MB")); v != "" {
+		cfg.ExecutorLogMaxSize = parsePositiveInt(v, cfg.ExecutorLogMaxSize)
+	}
+	if v := strings.TrimSpace(os.Getenv("GRUZILLA_EXECUTOR_LOG_MAX_BACKUPS")); v != "" {
+		cfg.ExecutorLogBackups = parseNonNegativeInt(v, cfg.ExecutorLogBackups)
+	}
+	if v := strings.TrimSpace(os.Getenv("GRUZILLA_EXECUTOR_LOG_MAX_AGE_DAYS")); v != "" {
+		cfg.ExecutorLogMaxAge = parseNonNegativeInt(v, cfg.ExecutorLogMaxAge)
+	}
 	cfg.CLIWorkDir = resolveCLIWorkDir(cfg.CLIWorkDir, absConfigPath)
 	autodetectCLIExecutable(&cfg)
 
-	log.Printf("config loaded: addr=%s cli=%s args=%v workdir=%s timeout=%ds default_executor_url=%s executor_logs_enabled=%t executor_log_file=%s",
-		cfg.Addr, cfg.CLICommand, cfg.CLIArgs, cfg.CLIWorkDir, cfg.CLITimeoutSeconds, cfg.DefaultExecutorURL, cfg.ExecutorLogsEnabled, cfg.ExecutorLogFile)
+	log.Printf("config loaded: addr=%s cli=%s args=%v workdir=%s timeout=%ds default_executor_url=%s executor_logs_enabled=%t executor_log_file=%s executor_log_max_size_mb=%d executor_log_max_backups=%d executor_log_max_age_days=%d",
+		cfg.Addr, cfg.CLICommand, cfg.CLIArgs, cfg.CLIWorkDir, cfg.CLITimeoutSeconds, cfg.DefaultExecutorURL, cfg.ExecutorLogsEnabled, cfg.ExecutorLogFile, cfg.ExecutorLogMaxSize, cfg.ExecutorLogBackups, cfg.ExecutorLogMaxAge)
 
 	return cfg
 }
@@ -212,11 +230,28 @@ func applyFileConfig(cfg *config, fc fileConfig) {
 	if strings.TrimSpace(fc.CLI.ExecutorLogFile) != "" {
 		cfg.ExecutorLogFile = strings.TrimSpace(fc.CLI.ExecutorLogFile)
 	}
+	if fc.CLI.ExecutorLogMaxSize != nil && *fc.CLI.ExecutorLogMaxSize > 0 {
+		cfg.ExecutorLogMaxSize = *fc.CLI.ExecutorLogMaxSize
+	}
+	if fc.CLI.ExecutorLogBackups != nil && *fc.CLI.ExecutorLogBackups >= 0 {
+		cfg.ExecutorLogBackups = *fc.CLI.ExecutorLogBackups
+	}
+	if fc.CLI.ExecutorLogMaxAge != nil && *fc.CLI.ExecutorLogMaxAge >= 0 {
+		cfg.ExecutorLogMaxAge = *fc.CLI.ExecutorLogMaxAge
+	}
 }
 
 func parsePositiveInt(s string, fallback int) int {
 	n := 0
 	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n); err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func parseNonNegativeInt(s string, fallback int) int {
+	n := 0
+	if _, err := fmt.Sscanf(strings.TrimSpace(s), "%d", &n); err != nil || n < 0 {
 		return fallback
 	}
 	return n
@@ -579,6 +614,15 @@ func (h *handler) executorsStart(w http.ResponseWriter, r *http.Request) {
 			args = append(args, "--log-file", p)
 		}
 	}
+	if h.cfg.ExecutorLogMaxSize > 0 {
+		args = append(args, "--log-max-size-mb", fmt.Sprintf("%d", h.cfg.ExecutorLogMaxSize))
+	}
+	if h.cfg.ExecutorLogBackups >= 0 {
+		args = append(args, "--log-max-backups", fmt.Sprintf("%d", h.cfg.ExecutorLogBackups))
+	}
+	if h.cfg.ExecutorLogMaxAge >= 0 {
+		args = append(args, "--log-max-age-days", fmt.Sprintf("%d", h.cfg.ExecutorLogMaxAge))
+	}
 	h.execCLIAndWrite(w, reqID, args...)
 }
 
@@ -637,6 +681,15 @@ func (h *handler) executorsRestart(w http.ResponseWriter, r *http.Request) {
 		if p := h.defaultExecutorLogFile(body.Addr); p != "" {
 			args = append(args, "--log-file", p)
 		}
+	}
+	if h.cfg.ExecutorLogMaxSize > 0 {
+		args = append(args, "--log-max-size-mb", fmt.Sprintf("%d", h.cfg.ExecutorLogMaxSize))
+	}
+	if h.cfg.ExecutorLogBackups >= 0 {
+		args = append(args, "--log-max-backups", fmt.Sprintf("%d", h.cfg.ExecutorLogBackups))
+	}
+	if h.cfg.ExecutorLogMaxAge >= 0 {
+		args = append(args, "--log-max-age-days", fmt.Sprintf("%d", h.cfg.ExecutorLogMaxAge))
 	}
 	if strings.TrimSpace(body.ExecutorURL) != "" {
 		args = append(args, "--executor-url", strings.TrimSpace(body.ExecutorURL))

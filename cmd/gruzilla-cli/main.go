@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -935,6 +934,26 @@ func buildTemplateContent(content, fromFile string) ([]byte, error) {
 	return []byte("{\"requestId\":\"{{requestId}}\"}\n"), nil
 }
 
+// configureExecutorProcessIO направляет вывод дочернего executor:
+// - text mode: в консоль текущего CLI;
+// - json mode: в os.DevNull, чтобы process не зависел от жизненного цикла CLI.
+// Важно для Windows: io.Discard использует pipe+goroutine и после выхода CLI
+// запись в stdout/stderr может завершить дочерний процесс.
+func configureExecutorProcessIO(proc *exec.Cmd, output string) error {
+	if strings.EqualFold(strings.TrimSpace(output), "text") {
+		proc.Stdout = os.Stdout
+		proc.Stderr = os.Stderr
+		return nil
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", os.DevNull, err)
+	}
+	proc.Stdout = devNull
+	proc.Stderr = devNull
+	return nil
+}
+
 // newExecutorsStartCmd поднимает новый процесс gruzilla-executor
 // (через `go run` либо указанный бинарник).
 func newExecutorsStartCmd(output *string) *cobra.Command {
@@ -942,6 +961,9 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 	var addr string
 	var bin string
 	var logFile string
+	var logMaxSizeMB int
+	var logMaxBackups int
+	var logMaxAgeDays int
 
 	cmd := &cobra.Command{
 		Use:   "start",
@@ -976,16 +998,20 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 			if strings.TrimSpace(logFile) != "" {
 				execArgs = append(execArgs, "--log-file", strings.TrimSpace(logFile))
 			}
+			if logMaxSizeMB > 0 {
+				execArgs = append(execArgs, "--log-max-size-mb", fmt.Sprintf("%d", logMaxSizeMB))
+			}
+			if logMaxBackups >= 0 {
+				execArgs = append(execArgs, "--log-max-backups", fmt.Sprintf("%d", logMaxBackups))
+			}
+			if logMaxAgeDays >= 0 {
+				execArgs = append(execArgs, "--log-max-age-days", fmt.Sprintf("%d", logMaxAgeDays))
+			}
 
 			proc := exec.Command(execCmd, execArgs...)
-			// Для backend (--output json) не наследуем консольные потоки,
-			// чтобы дочерний executor не держал stdout/stderr CLI-процесса.
-			if strings.EqualFold(strings.TrimSpace(*output), "text") {
-				proc.Stdout = os.Stdout
-				proc.Stderr = os.Stderr
-			} else {
-				proc.Stdout = io.Discard
-				proc.Stderr = io.Discard
+			// Для backend (--output json) отделяем I/O executor от stdout/stderr CLI.
+			if err := configureExecutorProcessIO(proc, *output); err != nil {
+				return err
 			}
 
 			if err := proc.Start(); err != nil {
@@ -1002,6 +1028,9 @@ func newExecutorsStartCmd(output *string) *cobra.Command {
 	cmd.Flags().StringVar(&addr, "addr", ":8081", "listen address for executor (e.g. :8081)")
 	cmd.Flags().StringVar(&bin, "bin", defaultExecutorBin(), "executor binary path (default: local gruzilla-executor[.exe], fallback: 'go')")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "optional path to executor log file")
+	cmd.Flags().IntVar(&logMaxSizeMB, "log-max-size-mb", 0, "max log file size in MB before rotate (0 = executor default)")
+	cmd.Flags().IntVar(&logMaxBackups, "log-max-backups", -1, "max rotated log files to keep (-1 = executor default)")
+	cmd.Flags().IntVar(&logMaxAgeDays, "log-max-age-days", -1, "max age of rotated logs in days (-1 = executor default)")
 
 	return cmd
 }
@@ -1014,6 +1043,9 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 	var bin string
 	var executorURL string
 	var logFile string
+	var logMaxSizeMB int
+	var logMaxBackups int
+	var logMaxAgeDays int
 
 	cmd := &cobra.Command{
 		Use:   "restart",
@@ -1046,13 +1078,18 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 			if strings.TrimSpace(logFile) != "" {
 				execArgs = append(execArgs, "--log-file", strings.TrimSpace(logFile))
 			}
+			if logMaxSizeMB > 0 {
+				execArgs = append(execArgs, "--log-max-size-mb", fmt.Sprintf("%d", logMaxSizeMB))
+			}
+			if logMaxBackups >= 0 {
+				execArgs = append(execArgs, "--log-max-backups", fmt.Sprintf("%d", logMaxBackups))
+			}
+			if logMaxAgeDays >= 0 {
+				execArgs = append(execArgs, "--log-max-age-days", fmt.Sprintf("%d", logMaxAgeDays))
+			}
 			proc := exec.Command(execCmd, execArgs...)
-			if strings.EqualFold(strings.TrimSpace(*output), "text") {
-				proc.Stdout = os.Stdout
-				proc.Stderr = os.Stderr
-			} else {
-				proc.Stdout = io.Discard
-				proc.Stderr = io.Discard
+			if err := configureExecutorProcessIO(proc, *output); err != nil {
+				return err
 			}
 			if err := proc.Start(); err != nil {
 				return fmt.Errorf("start executor: %w", err)
@@ -1067,6 +1104,9 @@ func newExecutorsRestartCmd(output *string) *cobra.Command {
 	cmd.Flags().StringVar(&bin, "bin", defaultExecutorBin(), "executor binary path (default: local gruzilla-executor[.exe], fallback: 'go')")
 	cmd.Flags().StringVar(&executorURL, "executor-url", "", "URL of running executor to shutdown (default http://localhost<addr>)")
 	cmd.Flags().StringVar(&logFile, "log-file", "", "optional path to executor log file")
+	cmd.Flags().IntVar(&logMaxSizeMB, "log-max-size-mb", 0, "max log file size in MB before rotate (0 = executor default)")
+	cmd.Flags().IntVar(&logMaxBackups, "log-max-backups", -1, "max rotated log files to keep (-1 = executor default)")
+	cmd.Flags().IntVar(&logMaxAgeDays, "log-max-age-days", -1, "max age of rotated logs in days (-1 = executor default)")
 	return cmd
 }
 

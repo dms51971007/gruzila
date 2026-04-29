@@ -9,3 +9,6 @@ cli:
   default_executor_url: "http://localhost:8081"
   executor_logs_enabled: true
   executor_log_file: "logs/executor-{addr}.log"
+  executor_log_max_size_mb: 50
+  executor_log_max_backups: 5
+  executor_log_max_age_days: 14

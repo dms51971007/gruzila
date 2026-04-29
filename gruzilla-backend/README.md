@@ -42,6 +42,9 @@ go run ./gruzilla-backend --config ".\config-backend.yml"
 - `cli.default_executor_url` — URL executor по умолчанию для UI/CLI.
 - `cli.executor_logs_enabled` — при `true` и старте executor через API backend передаётся путь лог-файла.
 - `cli.executor_log_file` — шаблон пути (например `logs/executor-{addr}.log`); подстановка `{addr}` из адреса listen executor.
+- `cli.executor_log_max_size_mb` — размер файла executor-лога (MB) до ротации.
+- `cli.executor_log_max_backups` — сколько ротаций хранить.
+- `cli.executor_log_max_age_days` — сколько дней хранить ротации.
 
 ### Как backend стартует executor
 
